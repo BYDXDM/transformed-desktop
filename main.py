@@ -166,7 +166,7 @@ class App(ttk.Window):
                   bootstyle="outline").pack(side=RIGHT, padx=2)
         
         # ===== 主区域 =====
-        main = ttk.PanedWindow(self, orient=HORIZONTAL)
+        main = ttk.Panedwindow(self, orient=HORIZONTAL)
         main.pack(fill=BOTH, expand=True, padx=10, pady=5)
         
         # 左侧功能面板
@@ -240,15 +240,15 @@ class App(ttk.Window):
         
         self.dl_type = tk.StringVar(value="mp4")
         ttk.Radiobutton(opt, text="🎬 视频 MP4", variable=self.dl_type,
-                       value="mp4", bootstyle="success-toolbutton").pack(side=LEFT, padx=2)
+                       value="mp4", bootstyle="success").pack(side=LEFT, padx=2)
         ttk.Radiobutton(opt, text="🎵 音频 MP3", variable=self.dl_type,
-                       value="mp3", bootstyle="warning-toolbutton").pack(side=LEFT, padx=2)
+                       value="mp3", bootstyle="warning").pack(side=LEFT, padx=2)
         
         ttk.Button(opt, text="⬇ 下载", bootstyle="success",
                   command=self._start_dl).pack(side=RIGHT, padx=5)
         
         # 下载进度
-        self.dl_prog = ttk.Progressbar(tab2, mode="determinate", bootstyle="info-striped")
+        self.dl_prog = ttk.Progressbar(tab2, mode="determinate", bootstyle="info")
         self.dl_prog.pack(fill=X, pady=5)
         self.dl_stat = ttk.Label(tab2, text="")
         self.dl_stat.pack(anchor=W)
@@ -295,7 +295,7 @@ class App(ttk.Window):
         self.convert_cards[key] = {
             "files": [],
             "label": ttk.Label(hdr, text="未选择文件", bootstyle="secondary"),
-            "progress": ttk.Progressbar(card, mode="determinate", bootstyle="success-striped"),
+            "progress": ttk.Progressbar(card, mode="determinate", bootstyle="success"),
             "status": ttk.Label(card, text=""),
             "pick_fn": pick_fn,
             "conv_fn": conv_fn,
@@ -329,7 +329,7 @@ class App(ttk.Window):
         for tag in ["全部", "EPUB", "MP4", "WebP", "下载"]:
             ttk.Radiobutton(filt, text=tag, variable=self.filter_var,
                           value=tag, command=self.history_tree_refresh,
-                          bootstyle="outline-toolbutton").pack(side=LEFT, padx=2)
+                          bootstyle="outline").pack(side=LEFT, padx=2)
         
         # 树状表格
         cols = ("time", "file", "type", "status")
