@@ -113,6 +113,7 @@ class App(ttk.Window):
         
         self.history = History()
         self.task_running = False
+        self.convert_cards = {}
         self.output_dir = str(Path.home() / "Downloads" / "transformed_output")
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         
@@ -278,9 +279,6 @@ class App(ttk.Window):
         self.log_text = scrolledtext.ScrolledText(tab3, height=15,
             font=("Consolas", 9), bg="#1a1a2e", fg="#e0e0e0")
         self.log_text.pack(fill=BOTH, expand=True, pady=5)
-        
-        # 存储控件引用
-        self.convert_cards = {}
     
     def _make_converter_card(self, parent, title, key, desc, pick_fn, conv_fn):
         """创建转换卡片"""
