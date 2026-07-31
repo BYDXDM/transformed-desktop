@@ -1,0 +1,36 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: |
+        pip install pyinstaller ttkbootstrap pillow yt-dlp mutagen ebooklib
+
+    - name: Build EXE
+      shell: cmd
+      run: |
+        pyinstaller --onefile --windowed --name "transformed" --hidden-import ttkbootstrap --hidden-import PIL._tkinter_finder --hidden-import ebooklib --hidden-import yt_dlp --hidden-import mutagen --collect-all ttkbootstrap main.py
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: transformed-windows-exe
+        path: dist/transformed.exe
