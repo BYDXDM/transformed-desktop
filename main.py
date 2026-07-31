@@ -652,6 +652,16 @@ class App(ttk.Window):
         self.task_running = True
         threading.Thread(target=self._do_dl, args=(url,), daemon=True).start()
     
+    def _fmt_speed(self, speed):
+        """格式化下载速度"""
+        if not speed:
+            return ""
+        if speed > 1024*1024:
+            return f"{speed/1024/1024:.1f} MB/s"
+        if speed > 1024:
+            return f"{speed/1024:.0f} KB/s"
+        return f"{speed} B/s"
+
     def _do_dl(self, url):
         is_mp3 = self.dl_type.get() == "mp3"
         
@@ -669,10 +679,32 @@ class App(ttk.Window):
         cb(0.05, "解析链接...")
         Logger.log(f"下载: {url} -> {ready_url}")
         
+        def progress_hook(d):
+            """yt-dlp 下载进度回调（工作线程）"""
+            if d['status'] == 'downloading':
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = d.get('downloaded_bytes') or 0
+                pct = (downloaded / total * 100) if total else 0
+                speed = d.get('speed') or 0
+                eta = d.get('eta') or 0
+                # 用 after 调度回主线程更新 UI
+                self.after(0, lambda p=pct, s=speed, e=eta:
+                           (self.dl_prog.config(value=min(p, 100)),
+                            self.dl_stat.config(
+                                text=f"下载中 {p:.1f}%  {self._fmt_speed(s)}  ETA {e}s" if s else
+                                     f"下载中... {p:.1f}%"),
+                            self.update_idletasks()))
+            elif d['status'] == 'finished':
+                self.after(0, lambda: (self.dl_prog.config(value=100),
+                                       self.dl_stat.config(text="100% 处理中..."),
+                                       self.update_idletasks()))
+        
         try:
             opts = {
                 "outtmpl": str(Path(self.output_dir) / "%(title)s.%(ext)s"),
                 "quiet": True, "no_warnings": True,
+                "progress_hooks": [progress_hook],
+                "noprogress": True,
             }
             # ffmpeg_location 需指向含 ffmpeg.exe 的实际目录
             ffmpeg_bin = get_ffmpeg_path()
