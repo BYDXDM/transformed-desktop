@@ -52,6 +52,77 @@ except ImportError:
 HISTORY_FILE = Path.home() / ".transformed_history.json"
 LOG_FILE = Path.home() / ".transformed_log.txt"
 
+# ===== ffmpeg 管理 =====
+def get_ffmpeg_dir():
+    """ffmpeg 安装目录：优先 exe 同目录，其次用户目录"""
+    # exe 打包后 __file__ 是临时解压目录，用 sys.executable 的目录
+    exe_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
+    return exe_dir / "ffmpeg"
+
+def get_ffmpeg_path():
+    """查找可用的 ffmpeg"""
+    # 1. 系统 PATH
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    # 2. 随 exe 分发
+    candidates = [
+        get_ffmpeg_dir() / "bin" / "ffmpeg.exe",
+        get_ffmpeg_dir() / "bin" / "ffmpeg",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+def download_ffmpeg(progress_cb=None):
+    """自动下载 ffmpeg for Windows"""
+    if os.name != "nt":
+        return False, "ffmpeg 自动下载仅支持 Windows，请手动安装"
+    
+    url = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+           "latest/ffmpeg-master-latest-win64-gpl-shared.zip")
+    
+    dest = get_ffmpeg_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    zip_path = dest / "ffmpeg.zip"
+    
+    try:
+        progress_cb and progress_cb("正在下载 ffmpeg (约30MB)...")
+        import urllib.request
+        urllib.request.urlretrieve(url, zip_path)
+        
+        progress_cb and progress_cb("正在解压...")
+        import zipfile
+        with zipfile.ZipFile(zip_path) as z:
+            # 解压到临时，然后移动 bin/ 内容
+            extract_dir = dest / "_extract"
+            extract_dir.mkdir(exist_ok=True)
+            z.extractall(extract_dir)
+        
+        # 找到 bin 目录（解压出来可能是 ffmpeg-master-latest-win64-gpl-shared/）
+        bin_dir = None
+        for d in extract_dir.iterdir():
+            b = d / "bin"
+            if b.exists():
+                bin_dir = b
+                break
+        
+        if bin_dir:
+            # 移动 ffmpeg.exe 到我们的 ffmpeg/bin/
+            target = dest / "bin"
+            target.mkdir(exist_ok=True)
+            for f in bin_dir.iterdir():
+                shutil.copy2(f, target / f.name)
+        
+        # 清理
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        zip_path.unlink(missing_ok=True)
+        
+        return True, str(get_ffmpeg_path())
+    except Exception as e:
+        return False, f"ffmpeg 下载失败: {e}"
+
 # ===== 工具类 =====
 class Logger:
     @staticmethod
@@ -121,7 +192,7 @@ class App(ttk.Window):
         self._check_deps()
     
     def _check_deps(self):
-        # 关键库缺失才提示（ffmpeg 可选，MP4转MP3才需要）
+        # 关键库缺失才提示（ffmpeg 可选，但提供自动下载）
         missing = []
         if not HAS_YTDLP:
             missing.append("yt-dlp")
@@ -133,10 +204,46 @@ class App(ttk.Window):
                           "\n".join(f"• {m}" for m in missing) +
                           "\n\n请重新打包 exe 或 pip install",
                           "warning")
-        elif not shutil.which("ffmpeg"):
-            # ffmpeg 可选，不阻塞启动，状态栏提示
-            self.status.config(
-                text="提示: 未检测到 ffmpeg，MP4转MP3功能不可用（其他功能正常）")
+        
+        # ffmpeg 缺失 → 询问是否自动下载
+        if not get_ffmpeg_path():
+            if messagebox.askyesno(
+                "ffmpeg 未找到",
+                "MP4转MP3和部分视频下载需要 ffmpeg。\n\n"
+                "是否现在自动下载并安装？\n"
+                "(约30MB，下载后即可使用)"):
+                self._setup_ffmpeg()
+            else:
+                self.status.config(
+                    text="提示: 未安装 ffmpeg，MP4转MP3功能不可用（其他功能正常）")
+    
+    def _setup_ffmpeg(self):
+        """启动 ffmpeg 自动下载"""
+        if self.task_running:
+            messagebox.showwarning("提示", "请等待当前任务完成")
+            return
+        self.task_running = True
+        self.status.config(text="正在下载并安装 ffmpeg...")
+        threading.Thread(target=self._download_ffmpeg_thread, daemon=True).start()
+    
+    def _download_ffmpeg_thread(self):
+        try:
+            def cb(msg):
+                self.status.config(text=msg)
+                self.update_idletasks()
+            
+            ok, result = download_ffmpeg(cb)
+            self.task_running = False
+            if ok:
+                self.status.config(text="✅ ffmpeg 安装完成，MP4转MP3现可用")
+                self.show_toast("成功", "ffmpeg 已自动安装完成！", "success")
+            else:
+                self.status.config(text="ffmpeg 安装失败")
+                self.show_toast("失败", result, "error")
+        except Exception as e:
+            self.task_running = False
+            self.status.config(text="ffmpeg 安装失败")
+            self.show_toast("失败", str(e), "error")
     
     def show_toast(self, title, msg, level="info"):
         dialog = ttk.Toplevel(self)
@@ -457,13 +564,14 @@ class App(ttk.Window):
             return False, str(e)
     
     def _conv_mp4(self, path, out_dir, cb):
-        if not shutil.which("ffmpeg"):
-            return False, "请安装 ffmpeg"
+        ffmpeg = get_ffmpeg_path()
+        if not ffmpeg:
+            return False, "未找到 ffmpeg，请重新启动程序并选择自动下载"
         try:
             cb(0.2, "提取音频...")
             name = Path(path).stem
             out = Path(out_dir) / f"{name}.mp3"
-            cmd = ["ffmpeg", "-i", str(path), "-vn",
+            cmd = [ffmpeg, "-i", str(path), "-vn",
                    "-acodec", "libmp3lame", "-ab", "192k",
                    "-y", str(out)]
             subprocess.run(cmd, capture_output=True)
@@ -521,6 +629,11 @@ class App(ttk.Window):
                 "outtmpl": str(Path(self.output_dir) / "%(title)s.%(ext)s"),
                 "quiet": True, "no_warnings": True,
             }
+            # 指定 ffmpeg 位置（若随 exe 分发则用它的）
+            ffmpeg_loc = get_ffmpeg_dir()
+            if ffmpeg_loc.exists():
+                opts["ffmpeg_location"] = str(ffmpeg_loc)
+            
             if is_mp3:
                 opts.update({
                     "format": "bestaudio/best",
