@@ -1,0 +1,37 @@
+name: Build Win7 EXE
+
+on:
+  push:
+    branches: [ "win7" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2019   # last runner supporting Win7, ships Python 3.8
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.8
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.8"
+
+    - name: Install Win7-compatible deps
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller==5.13.2 ttkbootstrap==1.10.1 pillow==10.4.0 yt-dlp==2024.8.6 mutagen ebooklib
+
+    - name: Build EXE (Win7 compatible)
+      shell: cmd
+      run: |
+        pyinstaller --onefile --windowed --name "transformed-win7" --hidden-import ttkbootstrap --hidden-import PIL._tkinter_finder --hidden-import ebooklib --hidden-import yt_dlp --hidden-import mutagen --collect-all ttkbootstrap main.py
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: transformed-win7-exe
+        path: dist/transformed-win7.exe
