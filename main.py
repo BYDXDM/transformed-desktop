@@ -121,33 +121,40 @@ class App(ttk.Window):
         self._check_deps()
     
     def _check_deps(self):
-        warnings = []
+        # 关键库缺失才提示（ffmpeg 可选，MP4转MP3才需要）
+        missing = []
         if not HAS_YTDLP:
-            warnings.append("yt-dlp (视频下载)")
+            missing.append("yt-dlp")
         if not HAS_EBOOKLIB:
-            warnings.append("ebooklib (EPUB转换)")
-        if not shutil.which("ffmpeg"):
-            warnings.append("ffmpeg (MP4→MP3)")
+            missing.append("ebooklib")
         
-        if warnings:
-            self.show_toast("缺少依赖", "请安装:\n" + "\n".join(f"• pip install {w}" for w in warnings),
+        if missing:
+            self.show_toast("缺少依赖", "以下功能库未找到:\n" +
+                          "\n".join(f"• {m}" for m in missing) +
+                          "\n\n请重新打包 exe 或 pip install",
                           "warning")
+        elif not shutil.which("ffmpeg"):
+            # ffmpeg 可选，不阻塞启动，状态栏提示
+            self.status.config(
+                text="提示: 未检测到 ffmpeg，MP4转MP3功能不可用（其他功能正常）")
     
     def show_toast(self, title, msg, level="info"):
         dialog = ttk.Toplevel(self)
         dialog.title(title)
-        dw, dh = 480, 220
+        dw, dh = 540, 240
+        # 居中且可拖动
         sx = self.winfo_x() + (self.winfo_width() - dw) // 2
         sy = self.winfo_y() + (self.winfo_height() - dh) // 2
         dialog.geometry(f"{dw}x{dh}+{sx}+{sy}")
+        dialog.resizable(False, False)
         dialog.transient(self)
-        dialog.grab_set()
+        # 不 grab_set，允许拖动和操作主窗口
         
         frame = ttk.Frame(dialog, padding=20)
         frame.pack(fill=BOTH, expand=True)
         ttk.Label(frame, text=msg, font=("", 11),
-                 wraplength=420).pack(pady=20)
-        ttk.Button(frame, text="确定", command=dialog.destroy).pack()
+                 wraplength=480, justify="left").pack(pady=18, fill=BOTH, expand=True)
+        ttk.Button(frame, text="  确定  ", command=dialog.destroy).pack()
     
     def _build_ui(self):
         # ===== 顶部标题栏 =====
