@@ -185,7 +185,8 @@ class App(ttk.Window):
         self.history = History()
         self.task_running = False
         self.convert_cards = {}
-        self.output_dir = str(Path.home() / "Downloads" / "transformed_output")
+        exe_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+        self.output_dir = str(exe_dir / "transformed_output")
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         
         self._build_ui()
@@ -604,6 +605,27 @@ class App(ttk.Window):
         except Exception as e:
             return False, str(e)
     
+    def _prepare_url(self, url):
+        """智能处理输入：支持裸 BV/AV 号、youtu.be、完整链接"""
+        url = url.strip()
+        if not url:
+            return url
+        # Bilibili BV号 (BV 后12位字母数字)
+        m = re.match(r'(BV[0-9A-Za-z]{10,12})', url)
+        if m:
+            return f"https://www.bilibili.com/video/{m.group(1)}"
+        # AV号
+        m = re.match(r'(av\d+)', url, re.IGNORECASE)
+        if m:
+            return f"https://www.bilibili.com/video/{m.group(1)}"
+        # 已经是完整 URL
+        if url.startswith(("http://", "https://")):
+            return url
+        # 其它情况补 https://
+        if "." in url:
+            return "https://" + url
+        return url
+
     def _start_dl(self):
         if self.task_running:
             self.show_toast("提示", "正在下载", "warning")
@@ -628,34 +650,43 @@ class App(ttk.Window):
             self.dl_stat.config(text=msg)
             self.update_idletasks()
         
+        ready_url = self._prepare_url(url)
         cb(0.05, "解析链接...")
-        Logger.log(f"下载: {url}")
+        Logger.log(f"下载: {url} -> {ready_url}")
         
         try:
             opts = {
                 "outtmpl": str(Path(self.output_dir) / "%(title)s.%(ext)s"),
                 "quiet": True, "no_warnings": True,
             }
-            # 指定 ffmpeg 位置（若随 exe 分发则用它的）
-            ffmpeg_loc = get_ffmpeg_dir()
-            if ffmpeg_loc.exists():
-                opts["ffmpeg_location"] = str(ffmpeg_loc)
+            # ffmpeg_location 需指向含 ffmpeg.exe 的实际目录
+            ffmpeg_bin = get_ffmpeg_path()
+            if ffmpeg_bin:
+                opts["ffmpeg_location"] = str(Path(ffmpeg_bin).parent)
             
-            if is_mp3:
-                opts.update({
-                    "format": "bestaudio/best",
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }],
-                })
+            # 3. 先判断平台再设格式
+            if "bilibili.com" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
+                # B站：用 bv*+ba 保证有音视频
+                if is_mp3:
+                    opts["format"] = "ba/b"
+                else:
+                    opts["format"] = "bv*+ba/b"
             else:
-                opts["format"] = "best[height<=720]/best"
+                if is_mp3:
+                    opts.update({
+                        "format": "bestaudio/best",
+                        "postprocessors": [{
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }],
+                    })
+                else:
+                    opts["format"] = "bv*+ba/best"
             
             cb(0.2, "下载中...")
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(ready_url, download=True)
             
             fn = ydl.prepare_filename(info)
             if is_mp3:
