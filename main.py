@@ -234,7 +234,6 @@ class App(ttk.Window):
                 self.update_idletasks()
             
             ok, result = download_ffmpeg(cb)
-            self.task_running = False
             if ok:
                 self.status.config(text="✅ ffmpeg 安装完成，MP4转MP3现可用")
                 self.show_toast("成功", "ffmpeg 已自动安装完成！", "success", _from_thread=True)
@@ -242,9 +241,10 @@ class App(ttk.Window):
                 self.status.config(text="ffmpeg 安装失败")
                 self.show_toast("失败", result, "error", _from_thread=True)
         except Exception as e:
-            self.task_running = False
             self.status.config(text="ffmpeg 安装失败")
             self.show_toast("失败", str(e), "error", _from_thread=True)
+        finally:
+            self.task_running = False
     
     def show_toast(self, title, msg, level="info", _from_thread=False):
         """线程安全的对话框。后台线程调用传 _from_thread=True"""
@@ -518,32 +518,38 @@ class App(ttk.Window):
         
         typ_name, conv_fn = conv_map[key]
         
-        for i, f in enumerate(files):
-            def mk_cb(i, f):
-                def cb(pct, msg):
-                    overall = (i / total) + (pct / total)
-                    ct["progress"]["value"] = overall * 100
-                    ct["status"].config(text=f"[{i+1}/{total}] {Path(f).name}: {msg}")
-                    self.dl_prog["value"] = overall * 100
-                    self.dl_stat.config(text=f"{typ_name}: [{i+1}/{total}]")
-                    self.update_idletasks()
-                return cb
-            
-            cb = mk_cb(i, f)
-            cb(0, "开始...")
-            ok, result = conv_fn(f, self.output_dir, cb)
-            self.history.add(Path(f).name, typ_name, ok, result if ok else "")
-            Logger.log(f"{'✅' if ok else '❌'} {typ_name}: {Path(f).name}")
-            self.status.config(text=f"{'完成' if ok else '失败'}: {Path(f).name}")
-        
-        self.task_running = False
-        ct["files"] = []
-        ct["label"].config(text="完成 ✓")
-        ct["progress"]["value"] = 0
-        self.dl_prog["value"] = 0
-        self.history_tree_refresh()
-        self._log_refresh()
-        self.show_toast("完成", f"批量 {typ_name} 转换完成!\n保存至: {self.output_dir}", "success", _from_thread=True)
+        try:
+            for i, f in enumerate(files):
+                def mk_cb(i, f):
+                    def cb(pct, msg):
+                        overall = (i / total) + (pct / total)
+                        ct["progress"]["value"] = overall * 100
+                        ct["status"].config(text=f"[{i+1}/{total}] {Path(f).name}: {msg}")
+                        self.dl_prog["value"] = overall * 100
+                        self.dl_stat.config(text=f"{typ_name}: [{i+1}/{total}]")
+                        self.update_idletasks()
+                    return cb
+                
+                cb = mk_cb(i, f)
+                cb(0, "开始...")
+                try:
+                    ok, result = conv_fn(f, self.output_dir, cb)
+                except Exception as e:
+                    ok, result = False, str(e)
+                    Logger.log(f"❌ 转换异常: {Path(f).name}: {e}")
+                self.history.add(Path(f).name, typ_name, ok, result if ok else "")
+                Logger.log(f"{'✅' if ok else '❌'} {typ_name}: {Path(f).name}")
+                self.status.config(text=f"{'完成' if ok else '失败'}: {Path(f).name}")
+        finally:
+            # 确保无论成功/异常都重置状态，防止卡死
+            self.task_running = False
+            ct["files"] = []
+            ct["label"].config(text="完成 ✓")
+            ct["progress"]["value"] = 0
+            self.dl_prog["value"] = 0
+            self.history_tree_refresh()
+            self._log_refresh()
+            self.show_toast("完成", f"批量 {typ_name} 转换完成!\n保存至: {self.output_dir}", "success", _from_thread=True)
     
     def _conv_epub(self, path, out_dir, cb):
         if not HAS_EBOOKLIB:
@@ -702,11 +708,11 @@ class App(ttk.Window):
             Logger.log(f"❌ 下载失败: {e}")
             self.status.config(text="下载失败")
             self.show_toast("下载失败", str(e), "error", _from_thread=True)
-        
-        self.task_running = False
-        self.dl_prog["value"] = 0
-        self.history_tree_refresh()
-        self._log_refresh()
+        finally:
+            self.task_running = False
+            self.dl_prog["value"] = 0
+            self.history_tree_refresh()
+            self._log_refresh()
     
     def history_tree_refresh(self):
         for item in self.tree.get_children():
