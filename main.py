@@ -236,16 +236,23 @@ class App(ttk.Window):
             self.task_running = False
             if ok:
                 self.status.config(text="✅ ffmpeg 安装完成，MP4转MP3现可用")
-                self.show_toast("成功", "ffmpeg 已自动安装完成！", "success")
+                self.show_toast("成功", "ffmpeg 已自动安装完成！", "success", _from_thread=True)
             else:
                 self.status.config(text="ffmpeg 安装失败")
-                self.show_toast("失败", result, "error")
+                self.show_toast("失败", result, "error", _from_thread=True)
         except Exception as e:
             self.task_running = False
             self.status.config(text="ffmpeg 安装失败")
-            self.show_toast("失败", str(e), "error")
+            self.show_toast("失败", str(e), "error", _from_thread=True)
     
-    def show_toast(self, title, msg, level="info"):
+    def show_toast(self, title, msg, level="info", _from_thread=False):
+        """线程安全的对话框。后台线程调用传 _from_thread=True"""
+        if _from_thread:
+            self.after(0, lambda: self._show_toast_ui(title, msg))
+            return
+        self._show_toast_ui(title, msg)
+    
+    def _show_toast_ui(self, title, msg):
         dialog = ttk.Toplevel(self)
         dialog.title(title)
         dw, dh = 540, 240
@@ -535,7 +542,7 @@ class App(ttk.Window):
         self.dl_prog["value"] = 0
         self.history_tree_refresh()
         self._log_refresh()
-        self.show_toast("完成", f"批量 {typ_name} 转换完成!\n保存至: {self.output_dir}", "success")
+        self.show_toast("完成", f"批量 {typ_name} 转换完成!\n保存至: {self.output_dir}", "success", _from_thread=True)
     
     def _conv_epub(self, path, out_dir, cb):
         if not HAS_EBOOKLIB:
@@ -613,7 +620,7 @@ class App(ttk.Window):
         
         if not HAS_YTDLP:
             self.task_running = False
-            self.show_toast("缺少依赖", "请安装 yt-dlp:\npip install yt-dlp", "error")
+            self.show_toast("缺少依赖", "请安装 yt-dlp:\npip install yt-dlp", "error", _from_thread=True)
             return
         
         def cb(pct, msg):
@@ -659,11 +666,11 @@ class App(ttk.Window):
             self.history.add(name, "下载", True, fn)
             Logger.log(f"✅ 下载成功: {name}")
             self.status.config(text=f"下载成功: {name}")
-            self.show_toast("下载成功", f"已保存:\n{fn}", "success")
+            self.show_toast("下载成功", f"已保存:\n{fn}", "success", _from_thread=True)
         except Exception as e:
             Logger.log(f"❌ 下载失败: {e}")
             self.status.config(text="下载失败")
-            self.show_toast("下载失败", str(e), "error")
+            self.show_toast("下载失败", str(e), "error", _from_thread=True)
         
         self.task_running = False
         self.dl_prog["value"] = 0
