@@ -1,8 +1,22 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 transformed 桌面版 - 现代化 UI
 格式转换 + 网络视频下载
 """
+
+import sys
+import io
+# 强制使用 UTF-8，解决 Windows 控制台乱码
+if sys.stdout and hasattr(sys.stdout, 'encoding'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+try:
+    io.sys = sys
+except Exception:
+    pass
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
