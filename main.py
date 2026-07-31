@@ -258,22 +258,19 @@ class App(ttk.Window):
         dialog = ttk.Toplevel(self)
         dialog.title(title)
         dw, dh = 540, 240
+        # 居中且可拖动
         sx = self.winfo_x() + (self.winfo_width() - dw) // 2
         sy = self.winfo_y() + (self.winfo_height() - dh) // 2
         dialog.geometry(f"{dw}x{dh}+{sx}+{sy}")
         dialog.resizable(False, False)
         dialog.transient(self)
-        dialog.grab_set()  # 模态：弹窗显示时禁止操作主窗口，避免误点
+        # 不 grab_set，允许拖动和操作主窗口
         
         frame = ttk.Frame(dialog, padding=20)
         frame.pack(fill=BOTH, expand=True)
         ttk.Label(frame, text=msg, font=("", 11),
                  wraplength=480, justify="left").pack(pady=18, fill=BOTH, expand=True)
-        def close():
-            dialog.grab_release()
-            dialog.destroy()
-        ttk.Button(frame, text="  确定  ", command=close).pack()
-        dialog.wait_window()  # 阻塞直到关闭，避免主线程被异步弹窗干扰
+        ttk.Button(frame, text="  确定  ", command=dialog.destroy).pack()
     
     def _build_ui(self):
         # ===== 顶部标题栏 =====
@@ -529,11 +526,11 @@ class App(ttk.Window):
                         overall = (i / total) + (pct / total)
                         # 线程安全：用 after 调度回主线程更新 UI
                         self.after(0, lambda p=overall, n=i, fn=Path(f).name, m=msg, t=typ_name: (
-                            ct["progress"].config(value=p * 100),
+                            ct["progress"].config(value=min(p * 100, 100)),
                             ct["status"].config(text=f"[{n+1}/{total}] {fn}: {m}"),
-                            self.dl_prog.config(value=p * 100),
+                            self.dl_prog.config(value=min(p * 100, 100)),
                             self.dl_stat.config(text=f"{t}: [{n+1}/{total}]"),
-                            None))
+                            self.update()))
                     return cb
                 
                 cb = mk_cb(i, f)
@@ -556,7 +553,7 @@ class App(ttk.Window):
                 self.dl_prog.config(value=0),
                 self.history_tree_refresh(),
                 self._log_refresh(),
-                None))
+                self.update()))
             self.show_toast("完成", f"批量 {typ_name} 转换完成!\n保存至: {self.output_dir}", "success", _from_thread=True)
     
     def _conv_epub(self, path, out_dir, cb):
@@ -701,11 +698,11 @@ class App(ttk.Window):
                             self.dl_stat.config(
                                 text=f"下载中 {p:.1f}%  {self._fmt_speed(s)}  ETA {e}s" if s else
                                      f"下载中... {p:.1f}%"),
-                            self.update_idletasks()))
+                            self.update()))
             elif d['status'] == 'finished':
                 self.after(0, lambda: (self.dl_prog.config(value=100),
                                        self.dl_stat.config(text="100% 处理中..."),
-                                       self.update_idletasks()))
+                                       self.update()))
         
         try:
             opts = {
