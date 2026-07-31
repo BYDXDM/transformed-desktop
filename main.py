@@ -354,9 +354,7 @@ class App(ttk.Window):
         url_entry = ttk.Entry(url_frame, textvariable=self.url_var,
                              font=("", 11))
         url_entry.pack(fill=X, side=LEFT, expand=True)
-        url_entry.insert(0, "支持 B站 / YouTube / Twitter / 直链")
-        url_entry.bind("<FocusIn>", lambda e: self.url_var.set("") if
-                      self.url_var.get() == "支持 B站 / YouTube / Twitter / 直链" else None)
+        url_entry.insert(0, "")  # 初始为空，无占位符干扰
         
         # 格式选择
         opt = ttk.Frame(tab2)
@@ -651,8 +649,8 @@ class App(ttk.Window):
             self.show_toast("提示", "正在下载", "warning")
             return
         url = self.url_var.get().strip()
-        if not url or url == "支持 B站 / YouTube / Twitter / 直链":
-            self.show_toast("提示", "请输入链接", "warning")
+        if not url:
+            self.show_toast("提示", "请输入视频链接", "warning")
             return
         self.task_running = True
         threading.Thread(target=self._do_dl, args=(url,), daemon=True).start()
