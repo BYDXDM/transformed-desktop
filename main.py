@@ -228,20 +228,21 @@ class App(ttk.Window):
         threading.Thread(target=self._download_ffmpeg_thread, daemon=True).start()
     
     def _download_ffmpeg_thread(self):
+        def set_status(msg):
+            self.after(0, lambda m=msg: self.status.config(text=m))
         try:
             def cb(msg):
-                self.status.config(text=msg)
-                self.update_idletasks()
+                set_status(msg)
             
             ok, result = download_ffmpeg(cb)
             if ok:
-                self.status.config(text="✅ ffmpeg 安装完成，MP4转MP3现可用")
+                set_status("✅ ffmpeg 安装完成，MP4转MP3现可用")
                 self.show_toast("成功", "ffmpeg 已自动安装完成！", "success", _from_thread=True)
             else:
-                self.status.config(text="ffmpeg 安装失败")
+                set_status("ffmpeg 安装失败")
                 self.show_toast("失败", result, "error", _from_thread=True)
         except Exception as e:
-            self.status.config(text="ffmpeg 安装失败")
+            set_status("ffmpeg 安装失败")
             self.show_toast("失败", str(e), "error", _from_thread=True)
         finally:
             self.task_running = False
@@ -523,11 +524,13 @@ class App(ttk.Window):
                 def mk_cb(i, f):
                     def cb(pct, msg):
                         overall = (i / total) + (pct / total)
-                        ct["progress"]["value"] = overall * 100
-                        ct["status"].config(text=f"[{i+1}/{total}] {Path(f).name}: {msg}")
-                        self.dl_prog["value"] = overall * 100
-                        self.dl_stat.config(text=f"{typ_name}: [{i+1}/{total}]")
-                        self.update_idletasks()
+                        # 线程安全：用 after 调度回主线程更新 UI
+                        self.after(0, lambda p=overall, n=i, fn=Path(f).name, m=msg, t=typ_name: (
+                            ct["progress"].config(value=p * 100),
+                            ct["status"].config(text=f"[{n+1}/{total}] {fn}: {m}"),
+                            self.dl_prog.config(value=p * 100),
+                            self.dl_stat.config(text=f"{t}: [{n+1}/{total}]"),
+                            None))
                     return cb
                 
                 cb = mk_cb(i, f)
@@ -539,16 +542,18 @@ class App(ttk.Window):
                     Logger.log(f"❌ 转换异常: {Path(f).name}: {e}")
                 self.history.add(Path(f).name, typ_name, ok, result if ok else "")
                 Logger.log(f"{'✅' if ok else '❌'} {typ_name}: {Path(f).name}")
-                self.status.config(text=f"{'完成' if ok else '失败'}: {Path(f).name}")
+                self.after(0, lambda u=ok, n=Path(f).name: self.status.config(
+                    text=f"{'完成' if u else '失败'}: {n}"))
         finally:
-            # 确保无论成功/异常都重置状态，防止卡死
+            # 确保无论成功/异常都重置状态，防止卡死（UI 操作调度回主线程）
             self.task_running = False
-            ct["files"] = []
-            ct["label"].config(text="完成 ✓")
-            ct["progress"]["value"] = 0
-            self.dl_prog["value"] = 0
-            self.history_tree_refresh()
-            self._log_refresh()
+            self.after(0, lambda k=ct: (
+                k["label"].config(text="完成 ✓"),
+                k["progress"].config(value=0),
+                self.dl_prog.config(value=0),
+                self.history_tree_refresh(),
+                self._log_refresh(),
+                None))
             self.show_toast("完成", f"批量 {typ_name} 转换完成!\n保存至: {self.output_dir}", "success", _from_thread=True)
     
     def _conv_epub(self, path, out_dir, cb):
