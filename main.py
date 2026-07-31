@@ -612,24 +612,33 @@ class App(ttk.Window):
             return False, str(e)
     
     def _prepare_url(self, url):
-        """智能处理输入：支持裸 BV/AV 号、youtu.be、完整链接"""
+        """智能处理输入：支持裸 BV/AV 号、b23短链、完整链接、混合文本"""
         url = url.strip()
         if not url:
             return url
-        # Bilibili BV号 (BV 后12位字母数字)
+
+        # 1. 从混合文本中提取 URL（用户可能粘贴带说明的文字）
+        url_match = re.search(r'(https?://[^\s<>"\'\]]+)', url, re.IGNORECASE)
+        if url_match:
+            url = url_match.group(1).rstrip('，。！？、,.;!?')
+            return url
+
+        # 2. Bilibili BV号 (BV 后12位字母数字)
         m = re.match(r'(BV[0-9A-Za-z]{10,12})', url)
         if m:
             return f"https://www.bilibili.com/video/{m.group(1)}"
-        # AV号
+        # 3. AV号
         m = re.match(r'(av\d+)', url, re.IGNORECASE)
         if m:
             return f"https://www.bilibili.com/video/{m.group(1)}"
-        # 已经是完整 URL
-        if url.startswith(("http://", "https://")):
-            return url
-        # 其它情况补 https://
-        if "." in url:
+        # 4. b23.tv 短链（分享常用）
+        m = re.match(r'(b23\.tv/[0-9A-Za-z]+)', url, re.IGNORECASE)
+        if m:
+            return f"https://{m.group(1)}"
+        # 5. 无协议完整域名
+        if "." in url and re.search(r'\.[a-zA-Z]{2,}(/|$)', url):
             return "https://" + url
+        # 6. 其他原样返回
         return url
 
     def _start_dl(self):
