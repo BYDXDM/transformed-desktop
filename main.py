@@ -893,5 +893,22 @@ class App(ttk.Window):
 
 
 if __name__ == "__main__":
+    import traceback as _tb
+    
+    # 全局异常兜底：未捕获异常记录到日志并提示，不崩溃
+    def _global_excepthook(exc_type, exc_value, exc_tb):
+        err = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        Logger.log(f"❌ 未捕获异常:\n{err}")
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            root = _tk.Tk()
+            root.withdraw()
+            _mb.showerror("程序错误", f"发生未处理的错误:\n{exc_value}\n\n详细已记录到日志")
+            root.destroy()
+        except Exception:
+            pass
+    
+    sys.excepthook = _global_excepthook
     app = App()
     app.mainloop()
