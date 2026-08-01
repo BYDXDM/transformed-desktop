@@ -496,6 +496,16 @@ class App(ttk.Window):
         self.task_running = True
         threading.Thread(target=self._do_convert, args=(key,), daemon=True).start()
     
+    def _should_skip(self, conv_type, file):
+        """判断文件是否已经是目标格式，如果是则跳过"""
+        ext = Path(file).suffix.lower()
+        target_exts = {
+            "epub": [".txt"],
+            "mp4": [".mp3"],
+            "webp": [".jpg", ".jpeg"],
+        }
+        return ext in target_exts.get(conv_type, [])
+
     def _do_convert(self, key):
         ct = self.convert_cards[key]
         files = ct["files"]
@@ -509,8 +519,20 @@ class App(ttk.Window):
         
         typ_name, conv_fn = conv_map[key]
         
+        skipped_count = 0
         try:
             for i, f in enumerate(files):
+                # 跳过已经是目标格式的文件
+                if self._should_skip(key, f):
+                    skipped_count += 1
+                    Logger.log(f"⏭️ 跳过(已是目标格式): {Path(f).name}")
+                    self.after(0, lambda n=Path(f).name, i=i: (
+                        ct["status"].config(text=f"[{i+1}/{total}] {n}: 已是目标格式，跳过"),
+                        self.update()))
+                    # 记入历史但标记为跳过
+                    self.history.add(Path(f).name, typ_name, True, "skipped")
+                    continue
+                
                 def mk_cb(i, f):
                     def cb(pct, msg):
                         overall = (i / total) + (pct / total)
@@ -544,7 +566,8 @@ class App(ttk.Window):
                 self.history_tree_refresh(),
                 self._log_refresh(),
                 self.update()))
-            self.show_toast("完成", f"批量 {typ_name} 转换完成!\n保存至: {self.output_dir}", "success", _from_thread=True)
+            skip_note = f"（跳过 {skipped_count} 个已是目标格式的文件）" if skipped_count else ""
+            self.show_toast("完成", f"批量 {typ_name} 转换完成{skip_note}!\n保存至: {self.output_dir}", "success", _from_thread=True)
     
     def _conv_epub(self, path, out_dir, cb):
         if not HAS_EBOOKLIB:
