@@ -130,8 +130,14 @@ class Logger:
         ts = datetime.now().strftime("%H:%M:%S")
         entry = f"[{ts}] {msg}"
         try:
+            # 追加并限制日志文件大小（避免无限增长）
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(entry + "\n")
+            # 日志超 500 行就裁剪
+            if LOG_FILE.exists() and sum(1 for _ in open(LOG_FILE, "r", errors="ignore")) > 500:
+                lines = Logger.read()[-300:]
+                with open(LOG_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(l + "\n" for l in lines)
         except:
             pass
         return entry
@@ -139,8 +145,11 @@ class Logger:
     @staticmethod
     def read():
         if LOG_FILE.exists():
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                return f.read().splitlines()
+            try:
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    return f.read().splitlines()
+            except:
+                return []
         return []
 
 class History:
@@ -497,14 +506,22 @@ class App(ttk.Window):
         threading.Thread(target=self._do_convert, args=(key,), daemon=True).start()
     
     def _should_skip(self, conv_type, file):
-        """判断文件是否已经是目标格式，如果是则跳过"""
+        """判断文件是否应跳过：已是目标格式 或 与本类无关"""
         ext = Path(file).suffix.lower()
-        target_exts = {
-            "epub": [".txt"],
-            "mp4": [".mp3"],
-            "webp": [".jpg", ".jpeg"],
+        # 每种转换接受的源格式
+        source_exts = {
+            "epub": [".epub"],
+            "mp4": [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts"],
+            "webp": [".webp", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"],
         }
-        return ext in target_exts.get(conv_type, [])
+        # 已是目标格式 → 跳过
+        target_exts = {"epub": [".txt"], "mp4": [".mp3"], "webp": [".jpg", ".jpeg"]}
+        if ext in target_exts.get(conv_type, []):
+            return "target"
+        # 与本类无关的文件（源格式都不匹配）→ 跳过
+        if ext not in source_exts.get(conv_type, []):
+            return "unrelated"
+        return None
 
     def _do_convert(self, key):
         ct = self.convert_cards[key]
@@ -522,15 +539,16 @@ class App(ttk.Window):
         skipped_count = 0
         try:
             for i, f in enumerate(files):
-                # 跳过已经是目标格式的文件
-                if self._should_skip(key, f):
+                # 跳过：已是目标格式 或 与本类无关的文件
+                skip_reason = self._should_skip(key, f)
+                if skip_reason:
                     skipped_count += 1
-                    Logger.log(f"⏭️ 跳过(已是目标格式): {Path(f).name}")
-                    self.after(0, lambda n=Path(f).name, i=i: (
-                        ct["status"].config(text=f"[{i+1}/{total}] {n}: 已是目标格式，跳过"),
+                    reason_text = "已是目标格式" if skip_reason == "target" else "非本类型文件"
+                    Logger.log(f"⏭️ 跳过({reason_text}): {Path(f).name}")
+                    self.after(0, lambda n=Path(f).name, i=i, rt=reason_text: (
+                        ct["status"].config(text=f"[{i+1}/{total}] {n}: {rt}，跳过"),
                         self.update()))
-                    # 记入历史但标记为跳过
-                    self.history.add(Path(f).name, typ_name, True, "skipped")
+                    self.history.add(Path(f).name, typ_name, True, "skipped:" + skip_reason)
                     continue
                 
                 def mk_cb(i, f):
@@ -723,6 +741,10 @@ class App(ttk.Window):
                 "quiet": True, "no_warnings": True,
                 "progress_hooks": [progress_hook],
                 "noprogress": True,
+                "retries": 3,          # 网络失败重试
+                "fragment_retries": 3, # 片段重试
+                "socket_timeout": 30,  # 网络超时
+                "concurrent_fragment_downloads": 4, # 多线程下载加速
             }
             # ffmpeg_location 需指向含 ffmpeg.exe 的实际目录
             ffmpeg_bin = get_ffmpeg_path()
@@ -765,8 +787,16 @@ class App(ttk.Window):
             self.show_toast("下载成功", f"已保存:\n{fn}", "success", _from_thread=True)
         except Exception as e:
             Logger.log(f"❌ 下载失败: {e}")
-            self.status.config(text="下载失败")
-            self.show_toast("下载失败", str(e), "error", _from_thread=True)
+            err = str(e)
+            hint = ""
+            if "timed out" in err or "timeout" in err:
+                hint = "\n\n提示: 网络超时，可能无法访问该网站(如YouTube/X需代理)"
+            elif "not a valid URL" in err or "404" in err:
+                hint = "\n\n提示: 链接无效或已失效，请检查"
+            elif "ffmpeg" in err.lower() or "ffprobe" in err.lower():
+                hint = "\n\n提示: 需要 ffmpeg，MP3下载或部分视频需要"
+            self.after(0, lambda: self.status.config(text="下载失败"))
+            self.show_toast("下载失败", err[:300] + hint, "error", _from_thread=True)
         finally:
             self.task_running = False
             self.dl_prog.config(value=0)
