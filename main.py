@@ -248,29 +248,21 @@ class App(ttk.Window):
             self.task_running = False
     
     def show_toast(self, title, msg, level="info", _from_thread=False):
-        """线程安全的对话框。后台线程调用传 _from_thread=True"""
+        """可靠的消息弹窗。后台线程调用传 _from_thread=True"""
         if _from_thread:
             self.after(0, lambda: self._show_toast_ui(title, msg))
             return
         self._show_toast_ui(title, msg)
     
     def _show_toast_ui(self, title, msg):
-        dialog = ttk.Toplevel(self)
-        dialog.title(title)
-        dw, dh = 540, 240
-        # 居中且可拖动
-        sx = self.winfo_x() + (self.winfo_width() - dw) // 2
-        sy = self.winfo_y() + (self.winfo_height() - dh) // 2
-        dialog.geometry(f"{dw}x{dh}+{sx}+{sy}")
-        dialog.resizable(False, False)
-        dialog.transient(self)
-        # 不 grab_set，允许拖动和操作主窗口
-        
-        frame = ttk.Frame(dialog, padding=20)
-        frame.pack(fill=BOTH, expand=True)
-        ttk.Label(frame, text=msg, font=("", 11),
-                 wraplength=480, justify="left").pack(pady=18, fill=BOTH, expand=True)
-        ttk.Button(frame, text="  确定  ", command=dialog.destroy).pack()
+        # 用 tkinter 原生 messagebox，中文渲染绝对可靠，避免"空弹窗"
+        msg = str(msg)
+        if level == "error":
+            messagebox.showerror(title, msg, parent=self)
+        elif level == "warning":
+            messagebox.showwarning(title, msg, parent=self)
+        else:
+            messagebox.showinfo(title, msg, parent=self)
     
     def _build_ui(self):
         # ===== 顶部标题栏 =====
@@ -674,7 +666,7 @@ class App(ttk.Window):
             return
         
         def cb(pct, msg):
-            self.dl_prog["value"] = pct * 100
+            self.dl_prog.config(value=pct * 100)
             self.dl_stat.config(text=msg)
             self.update_idletasks()
         
@@ -754,7 +746,7 @@ class App(ttk.Window):
             self.show_toast("下载失败", str(e), "error", _from_thread=True)
         finally:
             self.task_running = False
-            self.dl_prog["value"] = 0
+            self.dl_prog.config(value=0)
             self.history_tree_refresh()
             self._log_refresh()
     
