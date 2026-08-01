@@ -124,6 +124,36 @@ def download_ffmpeg(progress_cb=None):
         return False, f"ffmpeg 下载失败: {e}"
 
 # ===== 工具类 =====
+import urllib.request as _urlreq
+
+def check_foreign_access():
+    """检测当前网络能否访问外网(YouTube等)。返回 (bool, 信息)
+    - 能访问外网: (True, 描述)
+    - 不能(需代理): (False, 原因描述)
+    """
+    # 通过 ipinfo 获取出口 IP 归属地
+    try:
+        req = _urlreq.Request("https://ipinfo.io/json", 
+                             headers={"User-Agent": "Mozilla/5.0"})
+        with _urlreq.urlopen(req, timeout=5) as r:
+            import json as _j
+            data = _j.loads(r.read().decode())
+            country = data.get("country", "")
+            ip = data.get("ip", "?")
+            org = data.get("org", "")
+            if country == "CN":
+                return False, f"当前 IP({ip})归属中国，直连外网受限，下载 YouTube/X 需代理"
+            return True, f"当前 IP({ip}) 非中国归属，可访问外网"
+    except Exception as e:
+        # ipinfo 都连不上，尝试直接测 google 连通性
+        try:
+            req = _urlreq.Request("https://www.youtube.com", 
+                                 headers={"User-Agent": "Mozilla/5.0"})
+            with _urlreq.urlopen(req, timeout=5) as r:
+                return True, "可访问外网(YouTube可达)"
+        except Exception:
+            return False, "无法访问外网(YouTube不可达)，可能需要代理"
+
 class Logger:
     @staticmethod
     def log(msg):
@@ -715,12 +745,24 @@ class App(ttk.Window):
         cb(0.05, "解析链接...")
         Logger.log(f"下载: {url} -> {ready_url}")
         
-        # B. 外网平台(YouTube/X)提示（国内用户可能需代理）
+        # B. 外网平台(YouTube/X)预检测代理
         is_foreign = ("youtu" in ready_url or "x.com" in ready_url 
                      or "twitter" in ready_url)
         if is_foreign:
-            Logger.log("⚠ 检测到外网平台，国内网络可能需要代理才能下载")
-            self.after(0, lambda: self.dl_stat.config(text="外网平台，若无代理可能失败..."))
+            # 检测能否访问外网，不能则直接提示返回（跳过浪费时间的尝试）
+            cb(0.03, "检测网络环境...")
+            can_access, reason = check_foreign_access()
+            if not can_access:
+                # 无法访问外网，直接提示，不尝试下载
+                self.task_running = False
+                self.after(0, lambda: self.dl_prog.config(value=0))
+                Logger.log(f"⚠ 外网受限: {reason}")
+                self.show_toast("需要代理", 
+                    f"该视频在 YouTube/X，当前网络无法直接访问。\n\n{reason}\n\n"
+                    f"建议: 开启代理/VPN 后重试。\nB站等国内视频不受影响，可正常下载。", 
+                    "warning", _from_thread=True)
+                return
+            Logger.log(f"✅ 外网可访问: {reason}")
         
         def progress_hook(d):
             """yt-dlp 下载进度回调（工作线程）"""
