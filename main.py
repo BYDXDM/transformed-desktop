@@ -715,6 +715,13 @@ class App(ttk.Window):
         cb(0.05, "解析链接...")
         Logger.log(f"下载: {url} -> {ready_url}")
         
+        # B. 外网平台(YouTube/X)提示（国内用户可能需代理）
+        is_foreign = ("youtu" in ready_url or "x.com" in ready_url 
+                     or "twitter" in ready_url)
+        if is_foreign:
+            Logger.log("⚠ 检测到外网平台，国内网络可能需要代理才能下载")
+            self.after(0, lambda: self.dl_stat.config(text="外网平台，若无代理可能失败..."))
+        
         def progress_hook(d):
             """yt-dlp 下载进度回调（工作线程）"""
             if d['status'] == 'downloading':
@@ -746,6 +753,13 @@ class App(ttk.Window):
                 "socket_timeout": 30,  # 网络超时
                 "concurrent_fragment_downloads": 4, # 多线程下载加速
             }
+            # A. B站走国内API直连，优先国内CDN
+            if "bilibili" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
+                opts.update({
+                    "referer": "https://www.bilibili.com/",
+                    "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    "nocheckcertificate": False,
+                })
             # ffmpeg_location 需指向含 ffmpeg.exe 的实际目录
             ffmpeg_bin = get_ffmpeg_path()
             if ffmpeg_bin:
@@ -789,8 +803,12 @@ class App(ttk.Window):
             Logger.log(f"❌ 下载失败: {e}")
             err = str(e)
             hint = ""
-            if "timed out" in err or "timeout" in err:
-                hint = "\n\n提示: 网络超时，可能无法访问该网站(如YouTube/X需代理)"
+            if is_foreign and ("timed out" in err or "timeout" in err or "unable" in err or "403" in err):
+                hint = ("\n\n该视频在 YouTube/X，国内网络通常无法直接访问。\n"
+                        "建议: 开启代理/VPN后重试，或用浏览器打开该链接。\n"
+                        "B站等国内视频可正常下载。")
+            elif "timed out" in err or "timeout" in err:
+                hint = "\n\n提示: 网络超时，请检查网络或稍后重试"
             elif "not a valid URL" in err or "404" in err:
                 hint = "\n\n提示: 链接无效或已失效，请检查"
             elif "ffmpeg" in err.lower() or "ffprobe" in err.lower():
