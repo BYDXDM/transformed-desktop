@@ -790,10 +790,13 @@ class App(ttk.Window):
                 "quiet": True, "no_warnings": True,
                 "progress_hooks": [progress_hook],
                 "noprogress": True,
-                "retries": 3,          # 网络失败重试
-                "fragment_retries": 3, # 片段重试
+                "retries": 5,          # 断点续传重试
+                "fragment_retries": 5, # 分片续传重试
                 "socket_timeout": 30,  # 网络超时
                 "concurrent_fragment_downloads": 4, # 多线程下载加速
+                "continue": True,      # 断点续传（默认已开，显式声明）
+                "skip_unavailable_fragments": True, # 跳过失联分片，避免卡死
+                "fragment_retries_base": 2,  # 分片重试退避
             }
             # A. B站走国内API直连，优先国内CDN
             if "bilibili" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
