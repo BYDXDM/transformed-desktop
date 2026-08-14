@@ -373,8 +373,30 @@ class App(ttk.Window):
         # --- Tab 2: 网络下载 ---
         tab2 = ttk.Frame(nb, padding=15)
         nb.add(tab2, text="🌐 网络下载")
-        
-        # URL 输入
+
+        # ---- 歌曲搜索下载 ----
+        song_box = ttk.Labelframe(tab2, text="🎵 歌曲搜索下载（MP3 / 需代理）", padding=10)
+        song_box.pack(fill=X, pady=(0, 10))
+
+        ttk.Label(song_box, text="输入歌手 / 歌名，自动搜索下载 MP3",
+                 font=("", 10), bootstyle="secondary").pack(anchor=W)
+
+        song_frame = ttk.Frame(song_box)
+        song_frame.pack(fill=X, pady=5)
+
+        self.song_var = tk.StringVar()
+        song_entry = ttk.Entry(song_frame, textvariable=self.song_var,
+                             font=("", 11))
+        song_entry.pack(fill=X, side=LEFT, expand=True)
+        song_entry.bind("<Return>", lambda e: self._start_song_search())
+
+        ttk.Button(song_frame, text="🔍 搜索下载",
+                  bootstyle="warning", command=self._start_song_search).pack(side=RIGHT, padx=5)
+
+        ttk.Label(song_box, text="搜索来源: YouTube（第一首最匹配）。国内网络需代理。",
+                 font=("", 9), bootstyle="secondary").pack(anchor=W)
+
+        # ---- 视频链接下载 ----
         ttk.Label(tab2, text="视频链接 / BV号 / AV号",
                  font=("", 12)).pack(anchor=W)
         
@@ -728,6 +750,21 @@ class App(ttk.Window):
             return f"{speed/1024:.0f} KB/s"
         return f"{speed} B/s"
 
+    def _start_song_search(self):
+        """歌曲搜索下载：输入歌名，自动从 YouTube 搜第一首下载为 MP3"""
+        if self.task_running:
+            self.show_toast("提示", "正在下载", "warning")
+            return
+        q = self.song_var.get().strip()
+        if not q:
+            self.show_toast("提示", "请输入歌曲名或歌手", "warning")
+            return
+        # 构造 ytsearch: 前缀，让 yt-dlp 搜索并取第一首
+        self.dl_type.set("mp3")  # 歌曲固定下载为 MP3
+        search_url = f"ytsearch:{q}"
+        self.task_running = True
+        threading.Thread(target=self._do_dl, args=(search_url,), daemon=True).start()
+
     def _do_dl(self, url):
         is_mp3 = self.dl_type.get() == "mp3"
         
@@ -745,9 +782,9 @@ class App(ttk.Window):
         cb(0.05, "解析链接...")
         Logger.log(f"下载: {url} -> {ready_url}")
         
-        # B. 外网平台(YouTube/X)预检测代理
-        is_foreign = ("youtu" in ready_url or "x.com" in ready_url 
-                     or "twitter" in ready_url)
+        # B. 外网平台(YouTube/X/歌曲搜索)预检测代理
+        is_foreign = ("youtu" in ready_url or "ytsearch" in ready_url 
+                     or "x.com" in ready_url or "twitter" in ready_url)
         if is_foreign:
             # 检测能否访问外网，不能则直接提示返回（跳过浪费时间的尝试）
             cb(0.03, "检测网络环境...")
