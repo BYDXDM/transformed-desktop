@@ -125,6 +125,7 @@ def download_ffmpeg(progress_cb=None):
 
 # ===== 工具类 =====
 import urllib.request as _urlreq
+import urllib.parse
 
 def check_foreign_access():
     """检测当前网络能否访问外网(YouTube等)。返回 (bool, 信息)
@@ -153,6 +154,35 @@ def check_foreign_access():
                 return True, "可访问外网(YouTube可达)"
         except Exception:
             return False, "无法访问外网(YouTube不可达)，可能需要代理"
+
+
+def search_bilibili_song(query):
+    """从 B 站搜索视频（歌曲），返回第一个结果的视频链接；无结果返回 None。
+    用 B 站官方搜索接口（免签）。"""
+    try:
+        enc = urllib.parse.quote(query)
+        # 需带 buvid3 cookie 否则 B 站返回 412 风控拦截
+        req = _urlreq.Request(
+            f"https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword={enc}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.bilibili.com/",
+                "Cookie": "buvid3=infoc",
+            })
+        with _urlreq.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        if data.get("code") != 0:
+            return None
+        results = data.get("data", {}).get("result", [])
+        for item in results:
+            if isinstance(item, dict) and item.get("type") == "video":
+                bvid = item.get("bvid", "")
+                if bvid:
+                    return f"https://www.bilibili.com/video/{bvid}"
+        return None
+    except Exception as e:
+        Logger.log(f"B站搜索异常: {e}")
+        return None
 
 class Logger:
     @staticmethod
@@ -375,7 +405,7 @@ class App(ttk.Window):
         nb.add(tab2, text="🌐 网络下载")
 
         # ---- 歌曲搜索下载 ----
-        song_box = ttk.Labelframe(tab2, text="🎵 歌曲搜索下载（MP3 / 需代理）", padding=10)
+        song_box = ttk.Labelframe(tab2, text="🎵 歌曲搜索下载（MP3）", padding=10)
         song_box.pack(fill=X, pady=(0, 10))
 
         ttk.Label(song_box, text="输入歌手 / 歌名，自动搜索下载 MP3",
@@ -393,7 +423,7 @@ class App(ttk.Window):
         ttk.Button(song_frame, text="🔍 搜索下载",
                   bootstyle="warning", command=self._start_song_search).pack(side=RIGHT, padx=5)
 
-        ttk.Label(song_box, text="搜索来源: YouTube（第一首最匹配）。国内网络需代理。",
+        ttk.Label(song_box, text="搜索来源: B站优先（国内直连），暂无则手机外站兜底。",
                  font=("", 9), bootstyle="secondary").pack(anchor=W)
 
         # ---- 视频链接下载 ----
@@ -751,7 +781,7 @@ class App(ttk.Window):
         return f"{speed} B/s"
 
     def _start_song_search(self):
-        """歌曲搜索下载：输入歌名，自动从 YouTube 搜第一首下载为 MP3"""
+        """歌曲搜索下载：B站优先，B站搜不到则用 ytsearch 兜底（外站）"""
         if self.task_running:
             self.show_toast("提示", "正在下载", "warning")
             return
@@ -759,11 +789,22 @@ class App(ttk.Window):
         if not q:
             self.show_toast("提示", "请输入歌曲名或歌手", "warning")
             return
-        # 构造 ytsearch: 前缀，让 yt-dlp 搜索并取第一首
-        self.dl_type.set("mp3")  # 歌曲固定下载为 MP3
-        search_url = f"ytsearch:{q}"
+        # 固定下载为 MP3
+        self.dl_type.set("mp3")
         self.task_running = True
-        threading.Thread(target=self._do_dl, args=(search_url,), daemon=True).start()
+        def run(qq):
+            # 1. 先查 B 站（国内直连）
+            try:
+                url = search_bilibili_song(qq)
+                if url:
+                    self.after(0, lambda: self.dl_stat.config(text=f"B站命中: {qq}"))
+                    self._do_dl(url)
+                    return
+            except Exception as e:
+                Logger.log(f"B站搜索失败: {e}")
+            # 2. B 站没有 → ytsearch 兜底（外站，可能需代理）
+            self._do_dl(f"ytsearch:{qq}")
+        threading.Thread(target=run, args=(q,), daemon=True).start()
 
     def _do_dl(self, url):
         is_mp3 = self.dl_type.get() == "mp3"
