@@ -206,23 +206,36 @@ def search_bilibili_song(query):
         Logger.log(f"B站搜索异常: {e}")
         return None
 
+# 日志线程锁：防止多线程并发写/裁剪造成竞态
+_LOG_LOCK = threading.Lock()
+_LOG_MAX = 500   # 日志行数上限
+
 class Logger:
     @staticmethod
     def log(msg):
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts = datetime.now().strftime("%m-%d %H:%M:%S")
         entry = f"[{ts}] {msg}"
         try:
-            # 追加并限制日志文件大小（避免无限增长）
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(entry + "\n")
-            # 日志超 500 行就裁剪
-            if LOG_FILE.exists() and sum(1 for _ in open(LOG_FILE, "r", errors="ignore")) > 500:
-                lines = Logger.read()[-300:]
-                with open(LOG_FILE, "w", encoding="utf-8") as f:
-                    f.writelines(l + "\n" for l in lines)
+            with _LOG_LOCK:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(entry + "\n")
+                Logger._trim()
         except:
             pass
         return entry
+
+    @staticmethod
+    def _trim():
+        """日志超 _LOG_MAX 行时裁剪到 _LOG_MAX-100 行，避免无限增长。
+        加锁保护，避免多线程并发裁剪互相覆盖。"""
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            if len(lines) > _LOG_MAX:
+                with open(LOG_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-(_LOG_MAX - 100):])
+        except:
+            pass
     
     @staticmethod
     def read():
@@ -1009,7 +1022,8 @@ class App(ttk.Window):
     def _log_clear(self):
         self.log_text.delete(1.0, END)
         try:
-            open(LOG_FILE, "w", encoding="utf-8").close()
+            with _LOG_LOCK:
+                open(LOG_FILE, "w", encoding="utf-8").close()
         except:
             pass
 
