@@ -299,6 +299,14 @@ class App(ttk.Window):
         exe_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
         self.output_dir = str(exe_dir / "transformed_output")
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+
+        # ===== 下载队列 =====
+        self.dl_queue = []           # [{url, is_mp3, status, name, error}, ...]
+        self.dl_queue_lock = threading.Lock()
+        self.dl_queue_worker_running = False
+        self.dl_current_item = None  # 当前正在下载的队列项引用
+        self._url_placeholder_active = True
+        self._dl_pct = 0.0
         
         # 两侧看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
         # 目标高度 = 窗口高(800) - header(55) - status(35) - padding(30) ≈ 680
@@ -505,44 +513,113 @@ class App(ttk.Window):
         ttk.Label(song_box, text="搜索来源: B站优先（国内直连），暂无则手机外站兜底。",
                  font=("", 9), bootstyle="secondary").pack(anchor=W)
 
-        # ---- 视频链接下载 ----
-        url_box = ttk.Labelframe(tab2, text="🎬 视频链接下载", padding=12)
-        url_box.pack(fill=X)
-        
-        ttk.Label(url_box, text="支持 B站完整链接 / BV号 / AV号 / b23短链 / YouTube / X / 直链",
+        # ---- 视频链接批量下载 ----
+        url_box = ttk.Labelframe(tab2, text="🎬 视频链接下载（支持批量）", padding=12)
+        url_box.pack(fill=X, pady=(0, 8))
+
+        ttk.Label(url_box, text="每行一个链接，支持 B站/BV号/AV号/b23短链/YouTube/X/直链",
                  font=("", 9), bootstyle="secondary").pack(anchor=W, pady=(0, 4))
-        
-        url_frame = ttk.Frame(url_box)
-        url_frame.pack(fill=X, pady=3)
-        
-        self.url_var = tk.StringVar()
-        url_entry = ttk.Entry(url_frame, textvariable=self.url_var,
-                             font=("", 11))
-        url_entry.pack(fill=X, side=LEFT, expand=True)
-        url_entry.insert(0, "")  # 初始为空，无占位符干扰
-        
-        # 格式选择
-        opt = ttk.Frame(url_box)
-        opt.pack(fill=X, pady=(8, 2))
-        
+
+        # 多行文本输入框
+        self.url_text = tk.Text(url_box, height=4, font=("", 10),
+                                bg="#1a1a2e", fg="#e0e0e0", insertbackground="#e0e0e0",
+                                wrap=tk.WORD, relief=tk.FLAT, padx=8, pady=6)
+        self.url_text.pack(fill=X, pady=(0, 6))
+        # 占位符
+        self._url_placeholder = "粘贴链接到此处，每行一个...\n例如:\nhttps://www.bilibili.com/video/BV...\nyoutube.com/watch?v=..."
+        self._set_url_placeholder(True)
+        self.url_text.bind("<FocusIn>", self._on_url_text_focus_in)
+        self.url_text.bind("<FocusOut>", self._on_url_text_focus_out)
+
+        # 格式选择 + 按钮行
+        btn_row = ttk.Frame(url_box)
+        btn_row.pack(fill=X, pady=(0, 2))
+
         self.dl_type = tk.StringVar(value="mp4")
-        ttk.Radiobutton(opt, text="🎬 视频 MP4", variable=self.dl_type,
+        ttk.Radiobutton(btn_row, text="🎬 MP4", variable=self.dl_type,
                        value="mp4", bootstyle="success").pack(side=LEFT, padx=2)
-        ttk.Radiobutton(opt, text="🎵 音频 MP3", variable=self.dl_type,
+        ttk.Radiobutton(btn_row, text="🎵 MP3", variable=self.dl_type,
                        value="mp3", bootstyle="warning").pack(side=LEFT, padx=2)
-        
-        ttk.Button(opt, text="⬇ 下载", bootstyle="success",
-                  command=self._start_dl).pack(side=RIGHT, padx=5)
-        
-        # 下载进度
-        self.dl_prog = ttk.Progressbar(url_box, mode="determinate", bootstyle="info")
-        self.dl_prog.pack(fill=X, pady=6)
-        self.dl_stat = ttk.Label(url_box, text="")
+
+        ttk.Button(btn_row, text="➕ 添加到队列", bootstyle="info",
+                  command=self._start_dl).pack(side=RIGHT, padx=3)
+        ttk.Button(btn_row, text="▶ 开始下载", bootstyle="success",
+                  command=self._start_queue).pack(side=RIGHT, padx=3)
+        ttk.Button(btn_row, text="📂 打开文件夹", bootstyle="outline",
+                  command=self._open_output_folder).pack(side=RIGHT, padx=3)
+
+        # ---- 队列区 ----
+        queue_box = ttk.Labelframe(tab2, text="📋 下载队列", padding=8)
+        queue_box.pack(fill=BOTH, expand=True, pady=(0, 8))
+
+        # Treeview
+        q_cols = ("idx", "status", "name", "progress", "action")
+        self.queue_tree = ttk.Treeview(queue_box, columns=q_cols, show="headings",
+                                       height=8, bootstyle="info", selectmode="extended")
+        self.queue_tree.heading("idx", text="#")
+        self.queue_tree.heading("status", text="状态")
+        self.queue_tree.heading("name", text="文件名 / URL")
+        self.queue_tree.heading("progress", text="进度")
+        self.queue_tree.heading("action", text="操作")
+        self.queue_tree.column("idx", width=40, anchor=CENTER, stretch=False)
+        self.queue_tree.column("status", width=80, anchor=CENTER, stretch=False)
+        self.queue_tree.column("name", width=280)
+        self.queue_tree.column("progress", width=70, anchor=CENTER, stretch=False)
+        self.queue_tree.column("action", width=60, anchor=CENTER, stretch=False)
+        self.queue_tree.tag_configure("waiting", foreground="#8899aa")
+        self.queue_tree.tag_configure("downloading", foreground="#00ccff")
+        self.queue_tree.tag_configure("done", foreground="#44cc44")
+        self.queue_tree.tag_configure("failed", foreground="#ff5555")
+        self.queue_tree.tag_configure("retrying", foreground="#ffaa00")
+        q_scroll = ttk.Scrollbar(queue_box, command=self.queue_tree.yview)
+        self.queue_tree.configure(yscrollcommand=q_scroll.set)
+        self.queue_tree.pack(side=LEFT, fill=BOTH, expand=True)
+        q_scroll.pack(side=RIGHT, fill=Y)
+        # 键盘 Delete 删除
+        self.queue_tree.bind("<Delete>", lambda e: self._queue_delete_selected())
+        # 右键菜单
+        self._queue_menu = tk.Menu(self, tearoff=0)
+        self._queue_menu.add_command(label="▶ 开始下载", command=self._start_queue)
+        self._queue_menu.add_separator()
+        self._queue_menu.add_command(label="↻ 重试选中", command=self._queue_retry_selected)
+        self._queue_menu.add_command(label="⬆ 上移", command=lambda: self._queue_move(-1))
+        self._queue_menu.add_command(label="⬇ 下移", command=lambda: self._queue_move(1))
+        self._queue_menu.add_separator()
+        self._queue_menu.add_command(label="🗑 删除选中", command=self._queue_delete_selected)
+        self.queue_tree.bind("<Button-3>", self._show_queue_menu)  # 右键
+
+        # 队列操作按钮行
+        q_btns = ttk.Frame(queue_box)
+        q_btns.pack(fill=X, pady=(6, 0))
+        ttk.Button(q_btns, text="⬆ 上移", bootstyle="outline",
+                  command=lambda: self._queue_move(-1)).pack(side=LEFT, padx=2)
+        ttk.Button(q_btns, text="⬇ 下移", bootstyle="outline",
+                  command=lambda: self._queue_move(1)).pack(side=LEFT, padx=2)
+        ttk.Button(q_btns, text="↻ 重试选中", bootstyle="warning-outline",
+                  command=self._queue_retry_selected).pack(side=LEFT, padx=2)
+        ttk.Button(q_btns, text="🗑 删除选中", bootstyle="danger-outline",
+                  command=self._queue_delete_selected).pack(side=LEFT, padx=2)
+        ttk.Button(q_btns, text="清空队列", bootstyle="danger",
+                  command=self._queue_clear).pack(side=RIGHT, padx=2)
+
+        # ---- 进度区 ----
+        prog_box = ttk.Labelframe(tab2, text="📊 下载进度", padding=8)
+        prog_box.pack(fill=X)
+
+        self.dl_total_label = ttk.Label(prog_box, text="总进度: 0/0", font=("", 9))
+        self.dl_total_label.pack(anchor=W)
+        self.dl_total_prog = ttk.Progressbar(prog_box, mode="determinate", bootstyle="success")
+        self.dl_total_prog.pack(fill=X, pady=2)
+
+        ttk.Label(prog_box, text="当前:", font=("", 9)).pack(anchor=W, pady=(4, 0))
+        self.dl_prog = ttk.Progressbar(prog_box, mode="determinate", bootstyle="info")
+        self.dl_prog.pack(fill=X, pady=2)
+        self.dl_stat = ttk.Label(prog_box, text="")
         self.dl_stat.pack(anchor=W)
-        
+
         # 支持列表
-        info = ttk.Frame(tab2, padding=(6, 10, 6, 0))
-        info.pack(fill=X, pady=6)
+        info = ttk.Frame(tab2, padding=(6, 6, 6, 0))
+        info.pack(fill=X, pady=(4, 0))
         ttk.Label(info, text="✅ 支持的平台",
                  font=("", 11, "bold")).pack(anchor=W)
         for line in ["• Bilibili — BV/AV号或完整链接",
@@ -858,97 +935,166 @@ class App(ttk.Window):
         # 6. 其他原样返回
         return url
 
+    # ========== 下载队列相关 ==========
+    _STATUS_ICONS = {
+        "waiting": "○", "downloading": "▶", "done": "✓",
+        "failed": "✗", "retrying": "↻",
+    }
+
+    def _on_url_text_focus_in(self, event=None):
+        """文本框获得焦点时，若为占位符则清空"""
+        if self._url_placeholder_active:
+            self.url_text.delete("1.0", tk.END)
+            self.url_text.config(fg="#e0e0e0")
+            self._url_placeholder_active = False
+
+    def _on_url_text_focus_out(self, event=None):
+        """文本框失去焦点时，若为空则恢复占位符"""
+        self._set_url_placeholder(True)
+
+    def _set_url_placeholder(self, show):
+        if show:
+            content = self.url_text.get("1.0", tk.END).strip()
+            if not content:
+                self.url_text.delete("1.0", tk.END)
+                self.url_text.insert("1.0", self._url_placeholder)
+                self.url_text.config(fg="#667788")
+                self._url_placeholder_active = True
+            else:
+                self._url_placeholder_active = False
+        else:
+            self._url_placeholder_active = False
+
+    def _get_urls_from_text(self):
+        """从多行文本框提取 URL 列表（自动跳过占位符文字）"""
+        # 如果当前显示的是占位符，直接返回空
+        if self._url_placeholder_active:
+            return []
+        self._set_url_placeholder(False)
+        raw = self.url_text.get("1.0", tk.END).strip()
+        if not raw:
+            return []
+        lines = [l.strip() for l in raw.splitlines() if l.strip()]
+        # 去重保序
+        seen = set()
+        urls = []
+        for line in lines:
+            if line not in seen:
+                seen.add(line)
+                urls.append(line)
+        return urls
+
     def _start_dl(self):
-        if self.task_running:
-            self.show_toast("提示", "正在下载", "warning")
+        """将文本框中的链接添加到下载队列"""
+        urls = self._get_urls_from_text()
+        if not urls:
+            self.show_toast("提示", "请输入至少一个视频链接", "warning")
             return
-        url = self.url_var.get().strip()
-        if not url:
-            self.show_toast("提示", "请输入视频链接", "warning")
-            return
-        self.task_running = True
-        threading.Thread(target=self._do_dl, args=(url,), daemon=True).start()
-    
-    def _fmt_speed(self, speed):
-        """格式化下载速度"""
-        if not speed:
-            return ""
-        if speed > 1024*1024:
-            return f"{speed/1024/1024:.1f} MB/s"
-        if speed > 1024:
-            return f"{speed/1024:.0f} KB/s"
-        return f"{speed} B/s"
-
-    def _start_song_search(self):
-        """歌曲搜索下载：B站优先，B站搜不到则用 ytsearch 兜底（外站）"""
-        if self.task_running:
-            self.show_toast("提示", "正在下载", "warning")
-            return
-        q = self.song_var.get().strip()
-        if not q:
-            self.show_toast("提示", "请输入歌曲名或歌手", "warning")
-            return
-        # 固定下载为 MP3
-        self.dl_type.set("mp3")
-        self.task_running = True
-        def run(qq):
-            # 1. 先查 B 站（国内直连）
-            try:
-                url = search_bilibili_song(qq)
-                if url:
-                    self.after(0, lambda: self.dl_stat.config(text=f"B站命中: {qq}"))
-                    self._do_dl(url)
-                    return
-            except Exception as e:
-                Logger.log(f"B站搜索失败: {e}")
-            # 2. B 站没有 → ytsearch 兜底（外站，可能需代理）
-            self._do_dl(f"ytsearch:{qq}")
-        threading.Thread(target=run, args=(q,), daemon=True).start()
-
-    def _do_dl(self, url):
         is_mp3 = self.dl_type.get() == "mp3"
-        # 单调递增的显示进度(0~1)：防止多流下载/阶段切换时进度条倒退
-        self._dl_pct = 0.0
-        
-        if not HAS_YTDLP:
-            self.task_running = False
-            self.show_toast("缺少依赖", "请安装 yt-dlp:\npip install yt-dlp", "error", _from_thread=True)
+        added = 0
+        with self.dl_queue_lock:
+            for url in urls:
+                self.dl_queue.append({
+                    "url": url, "is_mp3": is_mp3,
+                    "status": "waiting", "name": url[:80], "error": "",
+                    "progress": "",
+                })
+                added += 1
+        self.after(0, self._queue_refresh_tree)
+        self.status.config(text=f"已添加 {added} 个链接到队列")
+        self.show_toast("已添加", f"已将 {added} 个链接加入下载队列", "info")
+        # 清空输入框
+        self.url_text.delete("1.0", tk.END)
+        self._set_url_placeholder(True)
+        # 自动启动队列 worker
+        self._start_queue_worker()
+
+    def _start_queue(self):
+        """手动点击开始下载"""
+        self._start_queue_worker()
+
+    def _start_queue_worker(self):
+        """启动队列消费线程（如果尚未运行）"""
+        if self.dl_queue_worker_running:
             return
-        
+        self.dl_queue_worker_running = True
+        threading.Thread(target=self._queue_worker, daemon=True).start()
+
+    def _queue_worker(self):
+        """后台线程：逐个消费队列中的 waiting 项"""
+        while True:
+            item = None
+            with self.dl_queue_lock:
+                for it in self.dl_queue:
+                    if it["status"] in ("waiting", "retrying"):
+                        item = it
+                        break
+            if item is None:
+                # 队列空，退出 worker
+                self.dl_queue_worker_running = False
+                self.after(0, lambda: self.status.config(text="队列下载完成"))
+                return
+            item["status"] = "downloading"
+            self.dl_current_item = item
+            self.after(0, self._queue_refresh_tree)
+            self.after(0, lambda n=item["name"][:40]:
+                       self.status.config(text=f"正在下载: {n}"))
+            try:
+                self._do_dl_item(item)
+            except Exception as e:
+                Logger.log(f"❌ 队列项异常: {e}")
+                item["status"] = "failed"
+                item["error"] = str(e)
+            self.dl_current_item = None
+            self.after(0, self._queue_refresh_tree)
+
+    def _do_dl_item(self, item):
+        """下载单个队列项（在后台线程中执行）"""
+        url = item["url"]
+        is_mp3 = item["is_mp3"]
+        # 单调递增的显示进度(0~1)
+        self._dl_pct = 0.0
+
+        if not HAS_YTDLP:
+            item["status"] = "failed"
+            item["error"] = "请安装 yt-dlp"
+            self.after(0, lambda: self.show_toast("缺少依赖", "请安装 yt-dlp:\npip install yt-dlp", "error", _from_thread=True))
+            return
+
         def cb(pct, msg):
-            # 后台线程调用：必须用 after 调度回主线程更新 UI，直接操作会随机崩溃
-            # 进度只增不减：解析阶段至少 5%，最终 100%
             pct = max(pct, 0.05)
             self._dl_pct = max(self._dl_pct, pct)
+            item["progress"] = f"{self._dl_pct*100:.1f}%"
             self.after(0, lambda p=self._dl_pct, m=msg: (
                 self.dl_prog.stop(),
                 self.dl_prog.config(value=p * 100, mode="determinate"),
                 self.dl_stat.config(text=m),
+                self._queue_refresh_tree(),
                 self.update_idletasks()))
-        
+
         ready_url = self._prepare_url(url)
         cb(0.05, "解析链接...")
         Logger.log(f"下载: {url} -> {ready_url}")
-        
+
         # B. 外网平台(YouTube/X/歌曲搜索)预检测代理
-        is_foreign = ("youtu" in ready_url or "ytsearch" in ready_url 
+        is_foreign = ("youtu" in ready_url or "ytsearch" in ready_url
                      or "x.com" in ready_url or "twitter" in ready_url)
         if is_foreign:
-            # 检测能否访问外网，不能则直接提示返回（跳过浪费时间的尝试）
             cb(0.03, "检测网络环境...")
             can_access, reason = check_foreign_access()
             if not can_access:
-                # 无法访问外网，直接提示，不尝试下载
-                self.task_running = False
-                self.after(0, lambda: self.dl_prog.config(value=0))
+                item["status"] = "failed"
+                item["error"] = reason
                 Logger.log(f"⚠ 外网受限: {reason}")
-                self.show_toast("需要代理", 
-                    f"该视频在 YouTube/X，当前网络无法直接访问。\n\n{reason}\n\n"
-                    f"建议: 开启代理/VPN 后重试。\nB站等国内视频不受影响，可正常下载。", 
-                    "warning", _from_thread=True)
+                self.after(0, lambda r=reason: (
+                    self.dl_prog.config(value=0),
+                    self.show_toast("需要代理",
+                        f"该视频在 YouTube/X，当前网络无法直接访问。\n\n{r}\n\n"
+                        f"建议: 开启代理/VPN 后重试。\nB站等国内视频不受影响，可正常下载。",
+                        "warning", _from_thread=True)))
                 return
             Logger.log(f"✅ 外网可访问: {reason}")
-        
+
         def progress_hook(d):
             """yt-dlp 下载进度回调（工作线程）"""
             status = d.get('status')
@@ -958,67 +1104,60 @@ class App(ttk.Window):
                 speed = d.get('speed') or 0
                 eta = d.get('eta') or 0
                 if total:
-                    # 映射到 5%~95% 区间（解析占5%，合并/转码占最后5%），只增不减
                     mapped = 0.05 + (downloaded / total) * 0.90
                     self._dl_pct = max(self._dl_pct, mapped)
                     pct_show = self._dl_pct * 100
-                    # 用 after 调度回主线程更新 UI
+                    item["progress"] = f"{pct_show:.1f}%"
                     self.after(0, lambda p=pct_show, s=speed, e=eta: (
                         self.dl_prog.stop(),
                         self.dl_prog.config(value=min(p, 100), mode="determinate"),
                         self.dl_stat.config(
                             text=f"下载中 {p:.1f}%  {self._fmt_speed(s)}  ETA {e}s" if s else
                                  f"下载中... {p:.1f}%"),
+                        self._queue_refresh_tree(),
                         self.update()))
                 else:
-                    # 大小未知（部分流媒体）：动画模式，避免进度条卡 0% 的错觉
                     self.after(0, lambda s=speed: (
                         self.dl_prog.config(mode="indeterminate"),
                         self.dl_prog.start(12),
                         self.dl_stat.config(text=f"下载中... {self._fmt_speed(s)}"),
                         self.update()))
             elif status == 'finished':
-                # 下载完成，进入合并/转码阶段
                 self.after(0, lambda: (
                     self.dl_prog.stop(),
                     self.dl_prog.config(mode="determinate", value=95),
                     self.dl_stat.config(text="95% 合并/转码中..."),
                     self.update()))
-        
+
         try:
             opts = {
                 "outtmpl": str(Path(self.output_dir) / "%(title)s.%(ext)s"),
                 "quiet": True, "no_warnings": True,
                 "progress_hooks": [progress_hook],
                 "noprogress": True,
-                "retries": 5,          # 断点续传重试
-                "fragment_retries": 5, # 分片续传重试
-                "socket_timeout": 30,  # 网络超时
-                "concurrent_fragment_downloads": 4, # 多线程下载加速
-                "continue": True,      # 断点续传（默认已开，显式声明）
-                "skip_unavailable_fragments": True, # 跳过失联分片，避免卡死
-                "fragment_retries_base": 2,  # 分片重试退避
-                "windowsfilenames": True,    # Windows 文件名非法字符自动清理
-                "noplaylist": True,          # 默认只下载单个视频，避免多P合集全量下载
+                "retries": 5,
+                "fragment_retries": 5,
+                "socket_timeout": 30,
+                "concurrent_fragment_downloads": 4,
+                "continue": True,
+                "skip_unavailable_fragments": True,
+                "fragment_retries_base": 2,
+                "windowsfilenames": True,
+                "noplaylist": True,
             }
-            # A. B站走国内API直连，优先国内CDN
             if "bilibili" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
                 opts.update({
                     "referer": "https://www.bilibili.com/",
-                    "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win6; x64) AppleWebKit/537.36"},
                     "nocheckcertificate": False,
                 })
-            # ffmpeg_location 需指向含 ffmpeg.exe 的实际目录
             ffmpeg_bin = get_ffmpeg_path()
             if ffmpeg_bin:
                 opts["ffmpeg_location"] = str(Path(ffmpeg_bin).parent)
-            
-            # 3. 先判断平台再设格式
+
             if "bilibili.com" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
-                # B站：用 bv*+ba 保证有音视频
                 if is_mp3:
                     opts["format"] = "ba/b"
-                    # 补上转码：B站音频是 m4a/aac，必须转成真正的 mp3
                     opts.update({
                         "postprocessors": [{
                             "key": "FFmpegExtractAudio",
@@ -1040,24 +1179,28 @@ class App(ttk.Window):
                     })
                 else:
                     opts["format"] = "bv*+ba/best"
-            
+
             cb(0.2, "下载中...")
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(ready_url, download=True)
-            
+
             fn = ydl.prepare_filename(info)
             if is_mp3:
                 fn = str(Path(fn).with_suffix(".mp3"))
-            
+
             cb(1.0, "完成!")
             name = Path(fn).name
+            item["name"] = name
+            item["status"] = "done"
+            item["progress"] = "100%"
             self.history.add(name, "下载", True, fn)
             Logger.log(f"✅ 下载成功: {name}")
-            self.after(0, lambda: self.status.config(text=f"下载成功: {name}"))
-            self.show_toast("下载成功", f"已保存:\n{fn}", "success", _from_thread=True)
+            self.after(0, lambda n=name: self.status.config(text=f"下载成功: {n}"))
         except Exception as e:
             Logger.log(f"❌ 下载失败: {e}")
             err = str(e)
+            item["status"] = "failed"
+            item["error"] = err[:200]
             hint = ""
             if is_foreign and ("timed out" in err or "timeout" in err or "unable" in err or "403" in err):
                 hint = ("\n\n该视频在 YouTube/X，国内网络通常无法直接访问。\n"
@@ -1069,22 +1212,156 @@ class App(ttk.Window):
                 hint = "\n\n提示: 链接无效或已失效，请检查"
             elif "ffmpeg" in err.lower() or "ffprobe" in err.lower():
                 hint = "\n\n提示: 需要 ffmpeg，MP3下载或部分视频需要"
-            self.after(0, lambda: self.status.config(text="下载失败"))
-            self.show_toast("下载失败", err[:300] + hint, "error", _from_thread=True)
-            # 失败：进度条归零
-            self.after(0, lambda: (self.dl_prog.stop(),
-                                   self.dl_prog.config(value=0, mode="determinate")))
+            self.after(0, lambda: (
+                self.status.config(text=f"下载失败: {item['name'][:30]}"),
+                self.show_toast("下载失败", err[:300] + hint, "error", _from_thread=True),
+                self.dl_prog.stop(),
+                self.dl_prog.config(value=0, mode="determinate")))
         finally:
-            # 全部调度回主线程，禁止后台线程直接碰 UI
-            # 成功时进度条保持 100%（由 cb(1.0) 设置），失败时由 except 归零
             self.after(0, lambda: (
                 self.dl_prog.stop(),
                 self.dl_prog.config(mode="determinate"),
+                self._queue_refresh_tree(),
                 self.history_tree_refresh(),
                 self._log_refresh(),
                 self.update()))
-            self.task_running = False
     
+    def _fmt_speed(self, speed):
+        """格式化下载速度"""
+        if not speed:
+            return ""
+        if speed > 1024*1024:
+            return f"{speed/1024/1024:.1f} MB/s"
+        if speed > 1024:
+            return f"{speed/1024:.0f} KB/s"
+        return f"{speed} B/s"
+
+    def _start_song_search(self):
+        """歌曲搜索下载：搜索结果 URL 直接加入队列"""
+        q = self.song_var.get().strip()
+        if not q:
+            self.show_toast("提示", "请输入歌曲名或歌手", "warning")
+            return
+        self.status.config(text=f"正在搜索: {q} ...")
+
+        def run():
+            url = None
+            # 1. 先查 B 站（国内直连）
+            try:
+                url = search_bilibili_song(q)
+                if url:
+                    self.after(0, lambda: self.dl_stat.config(text=f"B站命中: {q}"))
+            except Exception as e:
+                Logger.log(f"B站搜索失败: {e}")
+            # 2. B 站没有 → ytsearch 兜底
+            if not url:
+                url = f"ytsearch:{q}"
+            # 加入队列
+            with self.dl_queue_lock:
+                self.dl_queue.append({
+                    "url": url, "is_mp3": True,
+                    "status": "waiting", "name": f"🎵 {q}", "error": "",
+                    "progress": "",
+                })
+            self.after(0, lambda: (
+                self._queue_refresh_tree(),
+                self.status.config(text=f"已加入队列: {q}")))
+            self._start_queue_worker()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    # ========== 队列管理方法 ==========
+
+    def _open_output_folder(self):
+        """打开输出目录（Windows 专用）"""
+        try:
+            os.startfile(self.output_dir)
+        except Exception:
+            import subprocess as _sp
+            _sp.Popen(["xdg-open", self.output_dir] if os.name != "nt" else ["explorer", self.output_dir])
+
+    def _queue_refresh_tree(self):
+        """刷新队列 Treeview + 总进度"""
+        for item in self.queue_tree.get_children():
+            self.queue_tree.delete(item)
+        with self.dl_queue_lock:
+            total = len(self.dl_queue)
+            done_count = sum(1 for it in self.dl_queue if it["status"] == "done")
+            failed_count = sum(1 for it in self.dl_queue if it["status"] == "failed")
+            for i, it in enumerate(self.dl_queue):
+                icon = self._STATUS_ICONS.get(it["status"], "?")
+                status_text = f"{icon} {it['status']}"
+                name_text = it["name"][:50] if it["name"] else it["url"][:50]
+                progress_text = it.get("progress", "")
+                if it["status"] == "done":
+                    progress_text = "✓"
+                elif it["status"] == "failed":
+                    progress_text = "✗"
+                self.queue_tree.insert("", END, iid=str(i),
+                                       tags=(it["status"],),
+                                       values=(i + 1, status_text, name_text, progress_text, ""))
+        self.after(0, lambda d=done_count, t=total, f=failed_count: (
+            self.dl_total_label.config(text=f"总进度: {d}/{t}  ✗ {f}"),
+            self.dl_total_prog.config(value=(d / max(t, 1)) * 100),
+            self.update()))
+
+    def _show_queue_menu(self, event):
+        iid = self.queue_tree.identify_row(event.y)
+        if iid and iid not in self.queue_tree.selection():
+            self.queue_tree.selection_set(iid)
+        self._queue_menu.tk_popup(event.x_root, event.y_root)
+
+    def _queue_move(self, direction):
+        sel = self.queue_tree.selection()
+        if not sel:
+            return
+        with self.dl_queue_lock:
+            for iid in sel:
+                idx = int(iid)
+                new_idx = idx + direction
+                if 0 <= new_idx < len(self.dl_queue):
+                    self.dl_queue[idx], self.dl_queue[new_idx] = \
+                        self.dl_queue[new_idx], self.dl_queue[idx]
+        self._queue_refresh_tree()
+
+    def _queue_retry_selected(self):
+        sel = self.queue_tree.selection()
+        if not sel:
+            return
+        with self.dl_queue_lock:
+            for iid in sel:
+                idx = int(iid)
+                if 0 <= idx < len(self.dl_queue):
+                    it = self.dl_queue[idx]
+                    if it["status"] in ("failed", "done"):
+                        it["status"] = "retrying"
+                        it["error"] = ""
+                        it["progress"] = ""
+        self._queue_refresh_tree()
+        self._start_queue_worker()
+
+    def _queue_delete_selected(self):
+        sel = self.queue_tree.selection()
+        if not sel:
+            return
+        with self.dl_queue_lock:
+            for iid in sorted(sel, key=int, reverse=True):
+                idx = int(iid)
+                if 0 <= idx < len(self.dl_queue):
+                    it = self.dl_queue[idx]
+                    if it["status"] == "downloading":
+                        continue
+                    del self.dl_queue[idx]
+        self._queue_refresh_tree()
+
+    def _queue_clear(self):
+        if not messagebox.askyesno("确认", "清空队列中所有等待/失败的项？\n正在下载的项不会被删除。"):
+            return
+        with self.dl_queue_lock:
+            self.dl_queue = [it for it in self.dl_queue if it["status"] == "downloading"]
+        self._queue_refresh_tree()
+
+
     def history_tree_refresh(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
