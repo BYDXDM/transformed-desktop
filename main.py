@@ -567,10 +567,11 @@ class App(ttk.Window):
                           value=tag, command=self.history_tree_refresh,
                           bootstyle="secondary").pack(side=LEFT, padx=2)
         
-        # 树状表格
+        # 树状表格（支持 Ctrl/Shift 多选）
         cols = ("time", "file", "type", "status")
         self.tree = ttk.Treeview(parent, columns=cols, show="headings",
-                                 height=18, bootstyle="info")
+                                 height=18, bootstyle="info",
+                                 selectmode="extended")
         self.tree.heading("time", text="时间")
         self.tree.heading("file", text="文件")
         self.tree.heading("type", text="类型")
@@ -589,8 +590,10 @@ class App(ttk.Window):
         # 底部按钮
         btm = ttk.Frame(parent)
         btm.pack(fill=X, pady=5)
-        ttk.Button(btm, text="🗑 清空", bootstyle="danger-outline",
-                  command=self._history_clear).pack(side=RIGHT)
+        ttk.Button(btm, text="🗑 删除选中", bootstyle="warning-outline",
+                  command=self._history_delete_selected).pack(side=RIGHT, padx=2)
+        ttk.Button(btm, text="清空全部", bootstyle="danger-outline",
+                  command=self._history_clear).pack(side=RIGHT, padx=2)
         
         self.history_tree_refresh()
     
@@ -1029,11 +1032,33 @@ class App(ttk.Window):
         for item in self.tree.get_children():
             self.tree.delete(item)
         tag = self.filter_var.get()
-        for h in reversed(self.history.items):
+        items = self.history.items
+        # 从新到旧插入；iid 绑定原始索引，供"删除选中"精准定位
+        for idx in range(len(items) - 1, -1, -1):
+            h = items[idx]
             if tag != "全部" and tag not in h["type"]:
                 continue
             s = "✓" if h["ok"] else "✗"
-            self.tree.insert("", END, values=(h["time"], h["name"][:25], h["type"], s))
+            self.tree.insert("", END, iid=str(idx),
+                             values=(h["time"], h["name"][:25], h["type"], s))
+    
+    def _history_delete_selected(self):
+        """删除勾选的记录（支持多选）"""
+        sel = self.tree.selection()
+        if not sel:
+            self.show_toast("提示", "请先勾选要删除的记录", "warning")
+            return
+        if not messagebox.askyesno("确认", f"确定删除选中的 {len(sel)} 条记录？"):
+            return
+        # iid 即 history.items 的原始索引；倒序删除避免索引位移
+        for iid in sorted(sel, key=int, reverse=True):
+            idx = int(iid)
+            if 0 <= idx < len(self.history.items):
+                del self.history.items[idx]
+        self.history.save()
+        self.history_tree_refresh()
+        self.status.config(text=f"已删除 {len(sel)} 条记录")
+        Logger.log(f"🗑 删除历史记录 {len(sel)} 条")
     
     def _history_clear(self):
         if messagebox.askyesno("确认", "清空所有记录?"):
