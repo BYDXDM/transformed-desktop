@@ -11,11 +11,9 @@ sys.path.insert(0, BASE_DIR)
 
 def ensure_deps():
     needs = {
-        "ttkbootstrap": "ttkbootstrap",
         "PIL": "pillow",
         "yt_dlp": "yt-dlp",
         "ebooklib": "ebooklib",
-        "mutagen": "mutagen",
     }
     missing = [pkg for mod, pkg in needs.items() if not _import_ok(mod)]
     if missing:
