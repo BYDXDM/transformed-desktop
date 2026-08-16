@@ -242,15 +242,15 @@ class History:
     def load(self):
         if HISTORY_FILE.exists():
             try:
-                with open(HISTORY_FILE, "r") as f:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                     self.items = json.load(f)
             except:
                 self.items = []
     
     def save(self):
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(self.items[-500:], f, indent=2)
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.items[-500:], f, indent=2, ensure_ascii=False)
     
     def add(self, name, typ, ok, out=""):
         self.items.append({
@@ -341,11 +341,11 @@ class App(ttk.Window):
     def show_toast(self, title, msg, level="info", _from_thread=False):
         """可靠的消息弹窗。后台线程调用传 _from_thread=True"""
         if _from_thread:
-            self.after(0, lambda: self._show_toast_ui(title, msg))
+            self.after(0, lambda: self._show_toast_ui(title, msg, level))
             return
-        self._show_toast_ui(title, msg)
+        self._show_toast_ui(title, msg, level)
     
-    def _show_toast_ui(self, title, msg):
+    def _show_toast_ui(self, title, msg, level="info"):
         # 用 tkinter 原生 messagebox，中文渲染绝对可靠，避免"空弹窗"
         msg = str(msg)
         if level == "error":
@@ -412,8 +412,8 @@ class App(ttk.Window):
         
         # MP4
         self._make_converter_card(tab1, "MP4 → MP3", "mp4",
-            "提取 MP4 视频中的音频轨道，保存为 MP3",
-            lambda: self._pick("mp4", [("MP4", "*.mp4")]),
+            "提取视频中的音频轨道，保存为 MP3（支持 mp4/mkv/avi/mov/webm/flv/ts）",
+            lambda: self._pick("mp4", [("视频文件", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.ts")]),
             lambda: self._convert("mp4"))
         
         # WebP
@@ -537,7 +537,6 @@ class App(ttk.Window):
         ttk.Button(btn_frame, text="▶ 开始转换",
                   command=conv_fn, bootstyle="success").pack(side=LEFT, padx=2)
         
-        self.convert_cards[key]["label"].pack()
         self.convert_cards[key]["progress"].pack(fill=X, pady=4)
         self.convert_cards[key]["status"].pack(anchor=W)
     
@@ -553,7 +552,7 @@ class App(ttk.Window):
         for tag in ["全部", "EPUB", "MP4", "WebP", "下载"]:
             ttk.Radiobutton(filt, text=tag, variable=self.filter_var,
                           value=tag, command=self.history_tree_refresh,
-                          bootstyle="outline").pack(side=LEFT, padx=2)
+                          bootstyle="secondary").pack(side=LEFT, padx=2)
         
         # 树状表格
         cols = ("time", "file", "type", "status")
@@ -700,7 +699,7 @@ class App(ttk.Window):
             name = Path(path).stem
             out = Path(out_dir) / f"{name}.txt"
             texts = []
-            items = list(book.get_items_of_type(9))
+            items = list(book.get_items_of_type(epub.ITEM_DOCUMENT))
             for i, item in enumerate(items):
                 html = item.get_body_content().decode("utf-8", errors="replace")
                 text = re.sub(r'<[^>]+>', ' ', html)
@@ -728,7 +727,12 @@ class App(ttk.Window):
             cmd = [ffmpeg, "-i", str(path), "-vn",
                    "-acodec", "libmp3lame", "-ab", "192k",
                    "-y", str(out)]
-            subprocess.run(cmd, capture_output=True)
+            proc = subprocess.run(cmd, capture_output=True)
+            if proc.returncode != 0:
+                err = (proc.stderr or b"").decode("utf-8", errors="replace")[-300:]
+                return False, f"ffmpeg 转换失败(code={proc.returncode}): {err}"
+            if not Path(out).exists() or Path(out).stat().st_size == 0:
+                return False, "ffmpeg 未生成输出文件"
             cb(1.0, "完成")
             return True, str(out)
         except Exception as e:
@@ -763,12 +767,12 @@ class App(ttk.Window):
             url = url_match.group(1).rstrip('，。！？、,.;!?')
             return url
 
-        # 2. Bilibili BV号 (BV 后12位字母数字)
-        m = re.match(r'(BV[0-9A-Za-z]{10,12})', url)
+        # 2. Bilibili BV号 (BV 后12位字母数字)，从任意位置提取
+        m = re.search(r'(BV[0-9A-Za-z]{10})', url)
         if m:
             return f"https://www.bilibili.com/video/{m.group(1)}"
         # 3. AV号
-        m = re.match(r'(av\d+)', url, re.IGNORECASE)
+        m = re.search(r'(av\d+)', url, re.IGNORECASE)
         if m:
             return f"https://www.bilibili.com/video/{m.group(1)}"
         # 4. b23.tv 短链（分享常用）
@@ -837,9 +841,11 @@ class App(ttk.Window):
             return
         
         def cb(pct, msg):
-            self.dl_prog.config(value=pct * 100)
-            self.dl_stat.config(text=msg)
-            self.update_idletasks()
+            # 后台线程调用：必须用 after 调度回主线程更新 UI，直接操作会随机崩溃
+            self.after(0, lambda p=pct, m=msg: (
+                self.dl_prog.config(value=p * 100),
+                self.dl_stat.config(text=m),
+                self.update_idletasks()))
         
         ready_url = self._prepare_url(url)
         cb(0.05, "解析链接...")
@@ -897,6 +903,7 @@ class App(ttk.Window):
                 "continue": True,      # 断点续传（默认已开，显式声明）
                 "skip_unavailable_fragments": True, # 跳过失联分片，避免卡死
                 "fragment_retries_base": 2,  # 分片重试退避
+                "windowsfilenames": True,    # Windows 文件名非法字符自动清理
             }
             # A. B站走国内API直连，优先国内CDN
             if "bilibili" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
@@ -942,7 +949,7 @@ class App(ttk.Window):
             name = Path(fn).name
             self.history.add(name, "下载", True, fn)
             Logger.log(f"✅ 下载成功: {name}")
-            self.status.config(text=f"下载成功: {name}")
+            self.after(0, lambda: self.status.config(text=f"下载成功: {name}"))
             self.show_toast("下载成功", f"已保存:\n{fn}", "success", _from_thread=True)
         except Exception as e:
             Logger.log(f"❌ 下载失败: {e}")
@@ -961,10 +968,13 @@ class App(ttk.Window):
             self.after(0, lambda: self.status.config(text="下载失败"))
             self.show_toast("下载失败", err[:300] + hint, "error", _from_thread=True)
         finally:
+            # 全部调度回主线程，禁止后台线程直接碰 UI
+            self.after(0, lambda: (
+                self.dl_prog.config(value=0),
+                self.history_tree_refresh(),
+                self._log_refresh(),
+                self.update()))
             self.task_running = False
-            self.dl_prog.config(value=0)
-            self.history_tree_refresh()
-            self._log_refresh()
     
     def history_tree_refresh(self):
         for item in self.tree.get_children():
@@ -990,7 +1000,7 @@ class App(ttk.Window):
     def _log_clear(self):
         self.log_text.delete(1.0, END)
         try:
-            open(LOG_FILE, "w").close()
+            open(LOG_FILE, "w", encoding="utf-8").close()
         except:
             pass
 

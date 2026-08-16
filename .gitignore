@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 程序运行产物
+transformed_output/
+*.log
+
+# 构建产物
+build/
+dist/
+*.spec
+
+# 打包
+*.exe
+
+# IDE
+.idea/
+.vscode/
+*.swp
