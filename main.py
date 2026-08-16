@@ -279,12 +279,19 @@ class History:
 
 
 # ===== 主应用 =====
+def get_asset(name):
+    """获取资源文件路径（兼容 PyInstaller 打包后的临时解压目录）"""
+    base = Path(getattr(sys, '_MEIPASS', Path(__file__).parent))
+    p = base / "assets" / name
+    return str(p) if p.exists() else None
+
+
 class App(ttk.Window):
     def __init__(self):
         super().__init__(title="transformed", themename="superhero")
         
-        self.geometry("1100x720")
-        self.minsize(900, 600)
+        self.geometry("1280x800")
+        self.minsize(1050, 650)
         
         self.history = History()
         self.task_running = False
@@ -293,8 +300,33 @@ class App(ttk.Window):
         self.output_dir = str(exe_dir / "transformed_output")
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
         
+        # 两侧看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
+        # 目标高度 = 窗口高(800) - header(55) - status(35) - padding(30) ≈ 680
+        self._whale_h = 680
+        self.img_left = self._load_whale("whale_left.webp", 235, self._whale_h)
+        self.img_right = self._load_whale("whale_right.webp", 235, self._whale_h)
+        
         self._build_ui()
         self._check_deps()
+    
+    def _load_whale(self, fname, max_w, target_h=640):
+        """加载并缩放鲸鱼娘立绘（高度填满 target_h，宽度不超过 max_w）"""
+        try:
+            p = get_asset(fname)
+            if not p:
+                return None
+            img = Image.open(p)
+            w, h = img.size
+            # 按高度缩放，宽度不超过 max_w
+            scale_h = target_h / h
+            scale_w = max_w / w
+            scale = min(scale_h, scale_w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = img.resize((new_w, new_h), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception as e:
+            Logger.log(f"加载看板娘图片失败: {fname} {e}")
+            return None
     
     def _check_deps(self):
         # 关键库缺失才提示（ffmpeg 可选，但提供自动下载）
@@ -370,13 +402,13 @@ class App(ttk.Window):
     
     def _build_ui(self):
         # ===== 顶部标题栏 =====
-        header = ttk.Frame(self, padding=15)
+        header = ttk.Frame(self, padding=(18, 14, 14, 8))
         header.pack(fill=X)
         
-        ttk.Label(header, text="transformed", font=("", 22, "bold"),
+        ttk.Label(header, text="🐳 transformed", font=("", 22, "bold"),
                  bootstyle="inverse-primary").pack(side=LEFT)
-        ttk.Label(header, text="格式转换 · 视频下载",
-                 font=("", 10)).pack(side=LEFT, padx=10)
+        ttk.Label(header, text="格式转换 · 视频下载 · 深海女仆工坊",
+                 font=("", 10), bootstyle="secondary").pack(side=LEFT, padx=12, pady=(6, 0))
         
         # 设置按钮
         ttk.Button(header, text="⚙ 输出目录",
@@ -385,9 +417,21 @@ class App(ttk.Window):
                   command=lambda: self.history_tree_refresh(),
                   bootstyle="outline").pack(side=RIGHT, padx=2)
         
-        # ===== 主区域 =====
-        main = ttk.Panedwindow(self, orient=HORIZONTAL)
-        main.pack(fill=BOTH, expand=True, padx=10, pady=5)
+        # ===== 主区域（两侧看板娘 + 中间内容） =====
+        mid = ttk.Frame(self)
+        mid.pack(fill=BOTH, expand=True, padx=6, pady=2)
+        
+        # 左侧鲸鱼娘立绘（底部对齐，显示全身）
+        if self.img_left:
+            ttk.Label(mid, image=self.img_left).pack(side=LEFT, fill=Y, anchor="s")
+        
+        # 右侧鲸鱼娘立绘（底部对齐，显示全身）
+        if self.img_right:
+            ttk.Label(mid, image=self.img_right).pack(side=RIGHT, fill=Y, anchor="s")
+        
+        # 中间内容区
+        main = ttk.Panedwindow(mid, orient=HORIZONTAL)
+        main.pack(fill=BOTH, expand=True, padx=8, pady=4)
         
         # 左侧功能面板
         left = ttk.Frame(main)
@@ -401,11 +445,11 @@ class App(ttk.Window):
         self._build_right(right)
         
         # ===== 底部状态栏 =====
-        status = ttk.Frame(self, padding=5)
+        status = ttk.Frame(self, padding=(15, 4))
         status.pack(fill=X, side=BOTTOM)
-        self.status = ttk.Label(status, text="就绪", bootstyle="secondary")
+        self.status = ttk.Label(status, text="🐳 就绪", bootstyle="secondary")
         self.status.pack(side=LEFT)
-        ttk.Label(status, text="transformed Desktop v1.0",
+        ttk.Label(status, text="transformed Desktop v1.2 · 深海女仆工坊",
                  bootstyle="secondary").pack(side=RIGHT)
     
     def _build_left(self, parent):
@@ -440,7 +484,7 @@ class App(ttk.Window):
         nb.add(tab2, text="🌐 网络下载")
 
         # ---- 歌曲搜索下载 ----
-        song_box = ttk.Labelframe(tab2, text="🎵 歌曲搜索下载（MP3）", padding=10)
+        song_box = ttk.Labelframe(tab2, text="🎵 歌曲搜索下载（MP3）", padding=12)
         song_box.pack(fill=X, pady=(0, 10))
 
         ttk.Label(song_box, text="输入歌手 / 歌名，自动搜索下载 MP3",
@@ -462,11 +506,14 @@ class App(ttk.Window):
                  font=("", 9), bootstyle="secondary").pack(anchor=W)
 
         # ---- 视频链接下载 ----
-        ttk.Label(tab2, text="视频链接 / BV号 / AV号",
-                 font=("", 12)).pack(anchor=W)
+        url_box = ttk.Labelframe(tab2, text="🎬 视频链接下载", padding=12)
+        url_box.pack(fill=X)
         
-        url_frame = ttk.Frame(tab2)
-        url_frame.pack(fill=X, pady=5)
+        ttk.Label(url_box, text="支持 B站完整链接 / BV号 / AV号 / b23短链 / YouTube / X / 直链",
+                 font=("", 9), bootstyle="secondary").pack(anchor=W, pady=(0, 4))
+        
+        url_frame = ttk.Frame(url_box)
+        url_frame.pack(fill=X, pady=3)
         
         self.url_var = tk.StringVar()
         url_entry = ttk.Entry(url_frame, textvariable=self.url_var,
@@ -475,8 +522,8 @@ class App(ttk.Window):
         url_entry.insert(0, "")  # 初始为空，无占位符干扰
         
         # 格式选择
-        opt = ttk.Frame(tab2)
-        opt.pack(fill=X, pady=10)
+        opt = ttk.Frame(url_box)
+        opt.pack(fill=X, pady=(8, 2))
         
         self.dl_type = tk.StringVar(value="mp4")
         ttk.Radiobutton(opt, text="🎬 视频 MP4", variable=self.dl_type,
@@ -488,14 +535,14 @@ class App(ttk.Window):
                   command=self._start_dl).pack(side=RIGHT, padx=5)
         
         # 下载进度
-        self.dl_prog = ttk.Progressbar(tab2, mode="determinate", bootstyle="info")
-        self.dl_prog.pack(fill=X, pady=5)
-        self.dl_stat = ttk.Label(tab2, text="")
+        self.dl_prog = ttk.Progressbar(url_box, mode="determinate", bootstyle="info")
+        self.dl_prog.pack(fill=X, pady=6)
+        self.dl_stat = ttk.Label(url_box, text="")
         self.dl_stat.pack(anchor=W)
         
         # 支持列表
-        info = ttk.Frame(tab2, padding=10)
-        info.pack(fill=X, pady=10)
+        info = ttk.Frame(tab2, padding=(6, 10, 6, 0))
+        info.pack(fill=X, pady=6)
         ttk.Label(info, text="✅ 支持的平台",
                  font=("", 11, "bold")).pack(anchor=W)
         for line in ["• Bilibili — BV/AV号或完整链接",
@@ -521,13 +568,19 @@ class App(ttk.Window):
     
     def _make_converter_card(self, parent, title, key, desc, pick_fn, conv_fn):
         """创建转换卡片"""
+        icons = {"epub": "📖", "mp4": "🎬", "webp": "🖼️"}
+        tip = {"epub": "电子书转纯文本", "mp4": "提取视频音频", "webp": "图片转 JPEG"}
+        
         card = ttk.Frame(parent, padding=12, bootstyle="secondary")
-        card.pack(fill=X, pady=6)
+        card.pack(fill=X, pady=7)
         
         # 标题行
         hdr = ttk.Frame(card)
         hdr.pack(fill=X)
-        ttk.Label(hdr, text=title, font=("", 13, "bold")).pack(side=LEFT)
+        ttk.Label(hdr, text=f"{icons.get(key, '📁')} {title}", font=("", 14, "bold"),
+                 bootstyle="inverse-primary").pack(side=LEFT, padx=(2, 8))
+        ttk.Label(hdr, text=tip.get(key, ""), font=("", 9),
+                 bootstyle="secondary").pack(side=LEFT, pady=(4, 0))
         
         self.convert_cards[key] = {
             "files": [],
@@ -538,7 +591,7 @@ class App(ttk.Window):
             "conv_fn": conv_fn,
         }
         
-        self.convert_cards[key]["label"].pack(side=LEFT, padx=10)
+        self.convert_cards[key]["label"].pack(side=RIGHT, padx=10)
         
         ttk.Label(card, text=desc, bootstyle="secondary").pack(anchor=W, pady=2)
         
@@ -555,12 +608,12 @@ class App(ttk.Window):
     
     # ---- 右侧历史 ----
     def _build_right(self, parent):
-        ttk.Label(parent, text="📜 转换记录", font=("", 13, "bold"),
-                 bootstyle="inverse-secondary").pack(fill=X, pady=5)
+        ttk.Label(parent, text="📜 转换记录", font=("", 14, "bold"),
+                 bootstyle="inverse-secondary").pack(fill=X, pady=(2, 5))
         
         # 筛选
         filt = ttk.Frame(parent)
-        filt.pack(fill=X)
+        filt.pack(fill=X, pady=(0, 4))
         self.filter_var = tk.StringVar(value="全部")
         for tag in ["全部", "EPUB", "MP4", "WebP", "下载"]:
             ttk.Radiobutton(filt, text=tag, variable=self.filter_var,
@@ -576,10 +629,14 @@ class App(ttk.Window):
         self.tree.heading("file", text="文件")
         self.tree.heading("type", text="类型")
         self.tree.heading("status", text="状态")
-        self.tree.column("time", width=90)
+        self.tree.column("time", width=90, anchor=CENTER)
         self.tree.column("file", width=160)
-        self.tree.column("type", width=70)
-        self.tree.column("status", width=40)
+        self.tree.column("type", width=70, anchor=CENTER)
+        self.tree.column("status", width=40, anchor=CENTER)
+        
+        # 斑马纹：隔行背景色
+        self.tree.tag_configure("odd", background="#223140")
+        self.tree.tag_configure("even", background="#2b3e50")
         
         scroll = ttk.Scrollbar(parent, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
@@ -1034,13 +1091,16 @@ class App(ttk.Window):
         tag = self.filter_var.get()
         items = self.history.items
         # 从新到旧插入；iid 绑定原始索引，供"删除选中"精准定位
+        row = 0
         for idx in range(len(items) - 1, -1, -1):
             h = items[idx]
             if tag != "全部" and tag not in h["type"]:
                 continue
             s = "✓" if h["ok"] else "✗"
             self.tree.insert("", END, iid=str(idx),
+                             tags=("even" if row % 2 == 0 else "odd",),
                              values=(h["time"], h["name"][:25], h["type"], s))
+            row += 1
     
     def _history_delete_selected(self):
         """删除勾选的记录（支持多选）"""
