@@ -110,6 +110,14 @@ def _get_buvid3():
 
 def search_bilibili_song(query):
     """从 B 站搜索视频（歌曲），返回第一个结果的视频链接；无结果返回 None"""
+    results = search_bilibili_songs(query, limit=1)
+    return results[0]["url"] if results else None
+
+
+def search_bilibili_songs(query, limit=6):
+    """从 B 站搜索视频（歌曲），返回结果列表。
+    自动过滤翻唱、伴奏、纯音乐等非原唱结果。"""
+    results = []
     try:
         enc = urllib.parse.quote(query)
         buvid3 = _get_buvid3()
@@ -128,18 +136,32 @@ def search_bilibili_song(query):
             data = json.loads(r.read().decode("utf-8"))
         if data.get("code") != 0:
             log_msg("B站搜索被拒 code=%s: %s" % (data.get("code"), data.get("message", "")))
-            return None
-        results = data.get("data", {}).get("result", [])
-        for item in results:
-            if isinstance(item, dict) and item.get("type") == "video":
-                bvid = item.get("bvid", "")
-                if bvid:
-                    return "https://www.bilibili.com/video/%s" % bvid
-        log_msg("B站搜索无结果")
-        return None
+            return results
+        raw = data.get("data", {}).get("result", [])
+        skip_kw = ("翻唱", "cover", "伴奏", "纯音乐", "inst", "karaoke", "MV", "现场", "live")
+        for item in raw:
+            if not isinstance(item, dict) or item.get("type") != "video":
+                continue
+            bvid = item.get("bvid", "")
+            if not bvid:
+                continue
+            title = re.sub(r"</?em[^>]*>", "", item.get("title", "")).strip()
+            author = item.get("author", "")
+            duration = item.get("duration", "")
+            tl = title.lower()
+            if any(kw in tl for kw in skip_kw):
+                continue
+            results.append({
+                "bvid": bvid, "title": title, "author": author,
+                "duration": duration,
+                "url": "https://www.bilibili.com/video/%s" % bvid,
+            })
+            if len(results) >= limit:
+                break
+        log_msg("B站搜索 '%s' -> %d 条结果" % (query, len(results)))
     except Exception as e:
         log_msg("B站搜索异常: %s" % e)
-        return None
+    return results
 
 
 # =====================================================================
@@ -586,15 +608,16 @@ class App(tk.Tk):
         self._set_status("正在搜索: %s ..." % q)
 
         def run():
-            url = None
+            results = []
             try:
-                url = search_bilibili_song(q)
-                if url:
-                    self.after(0, lambda: self.dl_stat.config(text="B站命中: %s" % q))
+                results = search_bilibili_songs(q, limit=8)
             except Exception as e:
                 log_msg("B站搜索失败: %s" % e)
-            if not url:
-                url = "ytsearch:%s" % q
+            if results:
+                self.after(0, lambda r=results: self._show_song_results(q, r))
+                return
+            # B站无结果 → ytsearch 兜底
+            url = "ytsearch:%s" % q
             with self.dl_queue_lock:
                 self.dl_queue.append({
                     "url": url, "is_mp3": True,
@@ -603,10 +626,71 @@ class App(tk.Tk):
                 })
             self.after(0, lambda: (
                 self._queue_refresh_tree(),
-                self._set_status("已加入队列: %s" % q)))
+                self._set_status("B站无结果，已加入 YouTube 搜索: %s" % q)))
             self._start_queue_worker()
 
         threading.Thread(target=run, daemon=True).start()
+
+    def _show_song_results(self, query, results):
+        """弹窗展示 B 站搜索结果，让用户选择"""
+        dlg = tk.Toplevel(self)
+        dlg.title("选择歌曲 - %s" % query)
+        dlg.geometry("520x420")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        tk.Label(dlg, text="搜索: %s  （共 %d 条结果）" % (query, len(results)),
+                 font=("", 11, "bold"), fg="#00aaff").pack(padx=12, pady=(12, 6), anchor=W)
+        tk.Label(dlg, text="双击或点击「下载选中」加入队列",
+                 font=("", 9), fg="#888").pack(padx=12, anchor=W)
+
+        # 结果列表
+        cols = ("idx", "title", "author", "duration")
+        tree = tk.ttk.Treeview(dlg, columns=cols, show="headings", height=12)
+        tree.heading("idx", text="#")
+        tree.heading("title", text="标题")
+        tree.heading("author", text="UP主")
+        tree.heading("duration", text="时长")
+        tree.column("idx", width=35, anchor=CENTER, stretch=False)
+        tree.column("title", width=260)
+        tree.column("author", width=120)
+        tree.column("duration", width=60, anchor=CENTER, stretch=False)
+
+        for i, r in enumerate(results):
+            tree.insert("", END, iid=str(i),
+                        values=(i + 1, r["title"][:40], r["author"][:12], r["duration"]))
+
+        tree.pack(fill=BOTH, expand=True, padx=12, pady=6)
+
+        def on_select(event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            idx = int(sel[0])
+            r = results[idx]
+            url = r["url"]
+            title = r["title"]
+            with self.dl_queue_lock:
+                self.dl_queue.append({
+                    "url": url, "is_mp3": True,
+                    "status": "waiting", "name": "🎵 %s" % title, "error": "",
+                    "progress": "",
+                })
+            self.after(0, lambda: (
+                self._queue_refresh_tree(),
+                self._set_status("已加入队列: %s" % title)))
+            self._start_queue_worker()
+            dlg.destroy()
+
+        tree.bind("<Double-1>", on_select)
+
+        btn_frame = tk.Frame(dlg)
+        btn_frame.pack(fill=X, padx=12, pady=8)
+        tk.Button(btn_frame, text="下载选中", command=on_select,
+                  bg="#28a745", fg="white", font=("", 10, "bold")).pack(side=LEFT, padx=4)
+        tk.Button(btn_frame, text="取消", command=dlg.destroy,
+                  font=("", 10)).pack(side=RIGHT, padx=4)
 
     # ========== 转换逻辑 ==========
     def _convert(self, key):
