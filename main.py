@@ -847,6 +847,8 @@ class App(ttk.Window):
 
     def _do_dl(self, url):
         is_mp3 = self.dl_type.get() == "mp3"
+        # 单调递增的显示进度(0~1)：防止多流下载/阶段切换时进度条倒退
+        self._dl_pct = 0.0
         
         if not HAS_YTDLP:
             self.task_running = False
@@ -855,8 +857,12 @@ class App(ttk.Window):
         
         def cb(pct, msg):
             # 后台线程调用：必须用 after 调度回主线程更新 UI，直接操作会随机崩溃
-            self.after(0, lambda p=pct, m=msg: (
-                self.dl_prog.config(value=p * 100),
+            # 进度只增不减：解析阶段至少 5%，最终 100%
+            pct = max(pct, 0.05)
+            self._dl_pct = max(self._dl_pct, pct)
+            self.after(0, lambda p=self._dl_pct, m=msg: (
+                self.dl_prog.stop(),
+                self.dl_prog.config(value=p * 100, mode="determinate"),
                 self.dl_stat.config(text=m),
                 self.update_idletasks()))
         
@@ -885,23 +891,39 @@ class App(ttk.Window):
         
         def progress_hook(d):
             """yt-dlp 下载进度回调（工作线程）"""
-            if d['status'] == 'downloading':
+            status = d.get('status')
+            if status == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                 downloaded = d.get('downloaded_bytes') or 0
-                pct = (downloaded / total * 100) if total else 0
                 speed = d.get('speed') or 0
                 eta = d.get('eta') or 0
-                # 用 after 调度回主线程更新 UI
-                self.after(0, lambda p=pct, s=speed, e=eta:
-                           (self.dl_prog.config(value=min(p, 100)),
-                            self.dl_stat.config(
-                                text=f"下载中 {p:.1f}%  {self._fmt_speed(s)}  ETA {e}s" if s else
-                                     f"下载中... {p:.1f}%"),
-                            self.update()))
-            elif d['status'] == 'finished':
-                self.after(0, lambda: (self.dl_prog.config(value=100),
-                                       self.dl_stat.config(text="100% 处理中..."),
-                                       self.update()))
+                if total:
+                    # 映射到 5%~95% 区间（解析占5%，合并/转码占最后5%），只增不减
+                    mapped = 0.05 + (downloaded / total) * 0.90
+                    self._dl_pct = max(self._dl_pct, mapped)
+                    pct_show = self._dl_pct * 100
+                    # 用 after 调度回主线程更新 UI
+                    self.after(0, lambda p=pct_show, s=speed, e=eta: (
+                        self.dl_prog.stop(),
+                        self.dl_prog.config(value=min(p, 100), mode="determinate"),
+                        self.dl_stat.config(
+                            text=f"下载中 {p:.1f}%  {self._fmt_speed(s)}  ETA {e}s" if s else
+                                 f"下载中... {p:.1f}%"),
+                        self.update()))
+                else:
+                    # 大小未知（部分流媒体）：动画模式，避免进度条卡 0% 的错觉
+                    self.after(0, lambda s=speed: (
+                        self.dl_prog.config(mode="indeterminate"),
+                        self.dl_prog.start(12),
+                        self.dl_stat.config(text=f"下载中... {self._fmt_speed(s)}"),
+                        self.update()))
+            elif status == 'finished':
+                # 下载完成，进入合并/转码阶段
+                self.after(0, lambda: (
+                    self.dl_prog.stop(),
+                    self.dl_prog.config(mode="determinate", value=95),
+                    self.dl_stat.config(text="95% 合并/转码中..."),
+                    self.update()))
         
         try:
             opts = {
@@ -989,10 +1011,15 @@ class App(ttk.Window):
                 hint = "\n\n提示: 需要 ffmpeg，MP3下载或部分视频需要"
             self.after(0, lambda: self.status.config(text="下载失败"))
             self.show_toast("下载失败", err[:300] + hint, "error", _from_thread=True)
+            # 失败：进度条归零
+            self.after(0, lambda: (self.dl_prog.stop(),
+                                   self.dl_prog.config(value=0, mode="determinate")))
         finally:
             # 全部调度回主线程，禁止后台线程直接碰 UI
+            # 成功时进度条保持 100%（由 cb(1.0) 设置），失败时由 except 归零
             self.after(0, lambda: (
-                self.dl_prog.config(value=0),
+                self.dl_prog.stop(),
+                self.dl_prog.config(mode="determinate"),
                 self.history_tree_refresh(),
                 self._log_refresh(),
                 self.update()))
