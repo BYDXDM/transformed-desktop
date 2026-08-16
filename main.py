@@ -904,6 +904,7 @@ class App(ttk.Window):
                 "skip_unavailable_fragments": True, # 跳过失联分片，避免卡死
                 "fragment_retries_base": 2,  # 分片重试退避
                 "windowsfilenames": True,    # Windows 文件名非法字符自动清理
+                "noplaylist": True,          # 默认只下载单个视频，避免多P合集全量下载
             }
             # A. B站走国内API直连，优先国内CDN
             if "bilibili" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
@@ -922,6 +923,14 @@ class App(ttk.Window):
                 # B站：用 bv*+ba 保证有音视频
                 if is_mp3:
                     opts["format"] = "ba/b"
+                    # 补上转码：B站音频是 m4a/aac，必须转成真正的 mp3
+                    opts.update({
+                        "postprocessors": [{
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }],
+                    })
                 else:
                     opts["format"] = "bv*+ba/b"
             else:
