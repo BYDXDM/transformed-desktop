@@ -29,13 +29,13 @@ jobs:
 
     - name: Run offline tests
       run: |
-        python -m py_compile main.py run.pyw download_options.py
+        python -m py_compile main.py run.pyw download_options.py ui_helpers.py
         python -m unittest discover -s tests -v
 
     - name: Build EXE
       shell: cmd
       run: |
-        pyinstaller --onefile --windowed --name "transformed" --hidden-import ttkbootstrap --hidden-import PIL._tkinter_finder --hidden-import ebooklib --hidden-import yt_dlp --hidden-import mutagen --collect-all ttkbootstrap main.py
+        pyinstaller --onefile --windowed --name "transformed" --hidden-import ttkbootstrap --hidden-import PIL._tkinter_finder --hidden-import ebooklib --hidden-import yt_dlp --hidden-import mutagen --exclude-module PIL.AvifImagePlugin --collect-all ttkbootstrap main.py
 
     - name: Verify packaged EXE
       shell: pwsh

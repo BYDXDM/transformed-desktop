@@ -35,6 +35,7 @@ from PIL import Image, ImageTk
 import base64
 import io
 from download_options import build_download_options, prepare_url
+from ui_helpers import UiProgressEventQueue, selected_history_ids
 
 # ===== 尝试导入功能库 =====
 try:
@@ -330,9 +331,12 @@ class App(ttk.Window):
         self.dl_queue = []           # [{url, is_mp3, status, name, error}, ...]
         self.dl_queue_lock = threading.Lock()
         self.dl_queue_worker_running = False
+        self._ui_thread_id = threading.get_ident()
+        self._ui_closing = False
         self.dl_current_item = None  # 当前正在下载的队列项引用
         self._url_placeholder_active = True
         self._dl_pct = 0.0
+        self._progress_events = UiProgressEventQueue()
         
         # 两侧看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
         # 目标高度 = 窗口高(800) - header(55) - status(35) - padding(30) ≈ 680
@@ -341,6 +345,8 @@ class App(ttk.Window):
         self.img_right = self._load_whale("whale_right.webp", 235, self._whale_h)
         
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._ui_drain_after_id = self.after(50, self._drain_progress_events)
         self._check_deps()
     
     def _load_whale(self, fname, max_w, target_h=640):
@@ -399,7 +405,7 @@ class App(ttk.Window):
     
     def _download_ffmpeg_thread(self):
         def set_status(msg):
-            self.after(0, lambda m=msg: self.status.config(text=m))
+            self._run_on_ui("ffmpeg-status", lambda m=msg: self.status.config(text=m))
         try:
             def cb(msg):
                 set_status(msg)
@@ -418,9 +424,9 @@ class App(ttk.Window):
             self.task_running = False
     
     def show_toast(self, title, msg, level="info", _from_thread=False):
-        """可靠的消息弹窗。后台线程调用传 _from_thread=True"""
+        """可靠的消息弹窗；后台线程通过有界 UI mailbox 调度。"""
         if _from_thread:
-            self.after(0, lambda: self._show_toast_ui(title, msg, level))
+            self._run_on_ui("toast", lambda: self._show_toast_ui(title, msg, level))
             return
         self._show_toast_ui(title, msg, level)
     
@@ -746,10 +752,15 @@ class App(ttk.Window):
         
         self.tree.pack(side=LEFT, fill=BOTH, expand=True)
         scroll.pack(side=RIGHT, fill=Y)
+        self.tree.bind("<Control-a>", self._history_select_all_visible)
+        self.tree.bind("<Control-A>", self._history_select_all_visible)
+        self.tree.bind("<Delete>", lambda event: self._history_delete_selected())
         
         # 底部按钮
         btm = ttk.Frame(parent)
         btm.pack(fill=X, pady=5)
+        ttk.Button(btm, text="全选当前", bootstyle="secondary-outline",
+                   command=self._history_select_all_visible).pack(side=LEFT, padx=2)
         ttk.Button(btm, text="🗑 删除选中", bootstyle="warning-outline",
                   command=self._history_delete_selected).pack(side=RIGHT, padx=2)
         ttk.Button(btm, text="清空全部", bootstyle="danger-outline",
@@ -824,22 +835,24 @@ class App(ttk.Window):
                     skipped_count += 1
                     reason_text = "已是目标格式" if skip_reason == "target" else "非本类型文件"
                     Logger.log(f"⏭️ 跳过({reason_text}): {Path(f).name}")
-                    self.after(0, lambda n=Path(f).name, i=i, rt=reason_text: (
-                        ct["status"].config(text=f"[{i+1}/{total}] {n}: {rt}，跳过"),
-                        self.update()))
+                    self._run_on_ui("conversion-status", lambda n=Path(f).name, i=i, rt=reason_text: (
+                        ct["status"].config(text=f"[{i+1}/{total}] {n}: {rt}，跳过")))
                     self.history.add(Path(f).name, typ_name, True, "skipped:" + skip_reason)
                     continue
                 
                 def mk_cb(i, f):
                     def cb(pct, msg):
                         overall = (i / total) + (pct / total)
-                        # 线程安全：用 after 调度回主线程更新 UI
-                        self.after(0, lambda p=overall, n=i, fn=Path(f).name, m=msg, t=typ_name: (
-                            ct["progress"].config(value=min(p * 100, 100)),
-                            ct["status"].config(text=f"[{n+1}/{total}] {fn}: {m}"),
-                            self.dl_prog.config(value=min(p * 100, 100)),
-                            self.dl_stat.config(text=f"{t}: [{n+1}/{total}]"),
-                            self.update()))
+                        # Coalesce background progress notifications; never nest Tk's event loop.
+                        self._schedule_progress_ui(
+                            "conversion",
+                            lambda p=overall, n=i, fn=Path(f).name, m=msg, t=typ_name: (
+                                ct["progress"].config(value=min(p * 100, 100)),
+                                ct["status"].config(text=f"[{n+1}/{total}] {fn}: {m}"),
+                                self.dl_prog.config(value=min(p * 100, 100)),
+                                self.dl_stat.config(text=f"{t}: [{n+1}/{total}]"),
+                            ),
+                        )
                     return cb
                 
                 cb = mk_cb(i, f)
@@ -851,18 +864,17 @@ class App(ttk.Window):
                     Logger.log(f"❌ 转换异常: {Path(f).name}: {e}")
                 self.history.add(Path(f).name, typ_name, ok, result if ok else "")
                 Logger.log(f"{'✅' if ok else '❌'} {typ_name}: {Path(f).name}")
-                self.after(0, lambda u=ok, n=Path(f).name: self.status.config(
+                self._run_on_ui("conversion-status", lambda u=ok, n=Path(f).name: self.status.config(
                     text=f"{'完成' if u else '失败'}: {n}"))
         finally:
             # 确保无论成功/异常都重置状态，防止卡死（UI 操作调度回主线程）
             self.task_running = False
-            self.after(0, lambda k=ct: (
+            self._run_on_ui("conversion-finished", lambda k=ct: (
                 k["label"].config(text="完成 ✓"),
                 k["progress"].config(value=0),
                 self.dl_prog.config(value=0),
                 self.history_tree_refresh(),
-                self._log_refresh(),
-                self.update()))
+                self._log_refresh()))
             skip_note = f"（跳过 {skipped_count} 个已是目标格式的文件）" if skipped_count else ""
             self.show_toast("完成", f"批量 {typ_name} 转换完成{skip_note}!\n保存至: {self.output_dir}", "success", _from_thread=True)
     
@@ -935,6 +947,46 @@ class App(ttk.Window):
         """智能处理输入：支持裸 BV/AV 号、b23短链、完整链接、混合文本。"""
         return prepare_url(url)
 
+    def _schedule_progress_ui(self, source, callback):
+        """Queue worker progress; callbacks run only in Tk's owning thread."""
+        if not self._ui_closing:
+            self._progress_events.put(source, callback)
+
+    def _run_on_ui(self, source, callback):
+        """Dispatch all worker-originated Tk work through the bounded UI mailbox."""
+        if threading.get_ident() == self._ui_thread_id:
+            callback()
+        else:
+            self._schedule_progress_ui(source, callback)
+
+    def _drain_progress_events(self):
+        """Apply each source's latest pending update once per 50 ms UI tick."""
+        if self._ui_closing:
+            return
+        for callback in self._progress_events.take_all().values():
+            try:
+                callback()
+            except tk.TclError:
+                if self._ui_closing:
+                    return
+                raise
+        self._ui_drain_after_id = self.after(50, self._drain_progress_events)
+
+    def _on_close(self):
+        """Stop accepting worker UI work before destroying the Tk root."""
+        self._ui_closing = True
+        if getattr(self, "_ui_drain_after_id", None):
+            self.after_cancel(self._ui_drain_after_id)
+        self.destroy()
+
+    def _history_select_all_visible(self, event=None):
+        """Select every row currently visible after the active history filter."""
+        ids = selected_history_ids(self.tree.get_children())
+        if ids:
+            self.tree.selection_set(ids)
+            self.tree.focus(ids[0])
+        return "break"
+
     # ========== 下载队列相关 ==========
     _STATUS_ICONS = {
         "waiting": "○", "downloading": "▶", "done": "✓",
@@ -1000,7 +1052,7 @@ class App(ttk.Window):
                     "progress": "",
                 })
                 added += 1
-        self.after(0, self._queue_refresh_tree)
+        self._run_on_ui("queue-refresh", self._queue_refresh_tree)
         self.status.config(text=f"已添加 {added} 个链接到队列")
         self.show_toast("已添加", f"已将 {added} 个链接加入下载队列", "info")
         # 清空输入框
@@ -1015,9 +1067,10 @@ class App(ttk.Window):
 
     def _start_queue_worker(self):
         """启动队列消费线程（如果尚未运行）"""
-        if self.dl_queue_worker_running:
-            return
-        self.dl_queue_worker_running = True
+        with self.dl_queue_lock:
+            if self.dl_queue_worker_running:
+                return
+            self.dl_queue_worker_running = True
         threading.Thread(target=self._queue_worker, daemon=True).start()
 
     def _queue_worker(self):
@@ -1031,13 +1084,15 @@ class App(ttk.Window):
                         break
             if item is None:
                 # 队列空，退出 worker
-                self.dl_queue_worker_running = False
-                self.after(0, lambda: self.status.config(text="队列下载完成"))
+                with self.dl_queue_lock:
+                    self.dl_queue_worker_running = False
+                self._run_on_ui("queue-status", lambda: self.status.config(text="队列下载完成"))
                 return
-            item["status"] = "downloading"
-            self.dl_current_item = item
-            self.after(0, self._queue_refresh_tree)
-            self.after(0, lambda n=item["name"][:40]:
+            with self.dl_queue_lock:
+                item["status"] = "downloading"
+                self.dl_current_item = item
+            self._run_on_ui("queue-refresh", self._queue_refresh_tree)
+            self._run_on_ui("queue-status", lambda n=item["name"][:40]:
                        self.status.config(text=f"正在下载: {n}"))
             try:
                 self._do_dl_item(item)
@@ -1045,8 +1100,9 @@ class App(ttk.Window):
                 Logger.log(f"❌ 队列项异常: {e}")
                 item["status"] = "failed"
                 item["error"] = str(e)
-            self.dl_current_item = None
-            self.after(0, self._queue_refresh_tree)
+            with self.dl_queue_lock:
+                self.dl_current_item = None
+            self._run_on_ui("queue-refresh", self._queue_refresh_tree)
 
     def _do_dl_item(self, item):
         """下载单个队列项（在后台线程中执行）"""
@@ -1058,19 +1114,22 @@ class App(ttk.Window):
         if not HAS_YTDLP:
             item["status"] = "failed"
             item["error"] = "请安装 yt-dlp"
-            self.after(0, lambda: self.show_toast("缺少依赖", "请安装 yt-dlp:\npip install yt-dlp", "error", _from_thread=True))
+            self.show_toast("缺少依赖", "请安装 yt-dlp:\npip install yt-dlp", "error", _from_thread=True)
             return
 
         def cb(pct, msg):
             pct = max(pct, 0.05)
             self._dl_pct = max(self._dl_pct, pct)
             item["progress"] = f"{self._dl_pct*100:.1f}%"
-            self.after(0, lambda p=self._dl_pct, m=msg: (
-                self.dl_prog.stop(),
-                self.dl_prog.config(value=p * 100, mode="determinate"),
-                self.dl_stat.config(text=m),
-                self._queue_refresh_tree(),
-                self.update_idletasks()))
+            self._schedule_progress_ui(
+                "download",
+                lambda p=self._dl_pct, m=msg: (
+                    self.dl_prog.stop(),
+                    self.dl_prog.config(value=p * 100, mode="determinate"),
+                    self.dl_stat.config(text=m),
+                    self._queue_refresh_tree(),
+                ),
+            )
 
         ready_url = self._prepare_url(url)
         cb(0.05, "解析链接...")
@@ -1086,12 +1145,12 @@ class App(ttk.Window):
                 item["status"] = "failed"
                 item["error"] = reason
                 Logger.log(f"⚠ 外网受限: {reason}")
-                self.after(0, lambda r=reason: (
+                self._run_on_ui("download-error", lambda r=reason: (
                     self.dl_prog.config(value=0),
-                    self.show_toast("需要代理",
+                    self._show_toast_ui("需要代理",
                         f"该视频在 YouTube/X，当前网络无法直接访问。\n\n{r}\n\n"
                         f"建议: 开启代理/VPN 后重试。\nB站等国内视频不受影响，可正常下载。",
-                        "warning", _from_thread=True)))
+                        "warning")))
                 return
             Logger.log(f"✅ 外网可访问: {reason}")
 
@@ -1108,26 +1167,35 @@ class App(ttk.Window):
                     self._dl_pct = max(self._dl_pct, mapped)
                     pct_show = self._dl_pct * 100
                     item["progress"] = f"{pct_show:.1f}%"
-                    self.after(0, lambda p=pct_show, s=speed, e=eta: (
-                        self.dl_prog.stop(),
-                        self.dl_prog.config(value=min(p, 100), mode="determinate"),
-                        self.dl_stat.config(
-                            text=f"下载中 {p:.1f}%  {self._fmt_speed(s)}  ETA {e}s" if s else
-                                 f"下载中... {p:.1f}%"),
-                        self._queue_refresh_tree(),
-                        self.update()))
+                    self._schedule_progress_ui(
+                        "download",
+                        lambda p=pct_show, s=speed, e=eta: (
+                            self.dl_prog.stop(),
+                            self.dl_prog.config(value=min(p, 100), mode="determinate"),
+                            self.dl_stat.config(
+                                text=f"下载中 {p:.1f}%  {self._fmt_speed(s)}  ETA {e}s" if s else
+                                     f"下载中... {p:.1f}%"),
+                            self._queue_refresh_tree(),
+                        )
+                    )
                 else:
-                    self.after(0, lambda s=speed: (
-                        self.dl_prog.config(mode="indeterminate"),
-                        self.dl_prog.start(12),
-                        self.dl_stat.config(text=f"下载中... {self._fmt_speed(s)}"),
-                        self.update()))
+                    self._schedule_progress_ui(
+                        "download",
+                        lambda s=speed: (
+                            self.dl_prog.config(mode="indeterminate"),
+                            self.dl_prog.start(12),
+                            self.dl_stat.config(text=f"下载中... {self._fmt_speed(s)}"),
+                        )
+                    )
             elif status == 'finished':
-                self.after(0, lambda: (
-                    self.dl_prog.stop(),
-                    self.dl_prog.config(mode="determinate", value=95),
-                    self.dl_stat.config(text="95% 合并/转码中..."),
-                    self.update()))
+                self._schedule_progress_ui(
+                    "download",
+                    lambda: (
+                        self.dl_prog.stop(),
+                        self.dl_prog.config(mode="determinate", value=95),
+                        self.dl_stat.config(text="95% 合并/转码中..."),
+                    ),
+                )
 
         try:
             opts = build_download_options(
@@ -1153,7 +1221,7 @@ class App(ttk.Window):
             item["progress"] = "100%"
             self.history.add(name, "下载", True, fn)
             Logger.log(f"✅ 下载成功: {name}")
-            self.after(0, lambda n=name: self.status.config(text=f"下载成功: {n}"))
+            self._run_on_ui("download-status", lambda n=name: self.status.config(text=f"下载成功: {n}"))
         except Exception as e:
             Logger.log(f"❌ 下载失败: {e}")
             err = str(e)
@@ -1170,19 +1238,18 @@ class App(ttk.Window):
                 hint = "\n\n提示: 链接无效或已失效，请检查"
             elif "ffmpeg" in err.lower() or "ffprobe" in err.lower():
                 hint = "\n\n提示: 需要 ffmpeg，MP3下载或部分视频需要"
-            self.after(0, lambda: (
+            self._run_on_ui("download-error", lambda: (
                 self.status.config(text=f"下载失败: {item['name'][:30]}"),
-                self.show_toast("下载失败", err[:300] + hint, "error", _from_thread=True),
+                self._show_toast_ui("下载失败", err[:300] + hint, "error"),
                 self.dl_prog.stop(),
                 self.dl_prog.config(value=0, mode="determinate")))
         finally:
-            self.after(0, lambda: (
+            self._run_on_ui("download-finished", lambda: (
                 self.dl_prog.stop(),
                 self.dl_prog.config(mode="determinate"),
                 self._queue_refresh_tree(),
                 self.history_tree_refresh(),
-                self._log_refresh(),
-                self.update()))
+                self._log_refresh()))
     
     def _fmt_speed(self, speed):
         """格式化下载速度"""
@@ -1211,7 +1278,7 @@ class App(ttk.Window):
                 Logger.log(f"B站搜索失败: {e}")
             # 2. B 站有结果 → 弹窗让用户选择
             if results:
-                self.after(0, lambda r=results: self._show_song_results(q, r))
+                self._run_on_ui("song-results", lambda r=results: self._show_song_results(q, r))
                 return
             # 3. B 站无结果 → ytsearch 兜底（直接加入队列）
             url = f"ytsearch:{q}"
@@ -1221,7 +1288,7 @@ class App(ttk.Window):
                     "status": "waiting", "name": f"🎵 {q}", "error": "",
                     "progress": "",
                 })
-            self.after(0, lambda: (
+            self._run_on_ui("song-fallback", lambda: (
                 self._queue_refresh_tree(),
                 self.status.config(text=f"B站无结果，已加入 YouTube 搜索: {q}")))
             self._start_queue_worker()
@@ -1275,7 +1342,7 @@ class App(ttk.Window):
                     "status": "waiting", "name": f"🎵 {title}", "error": "",
                     "progress": "",
                 })
-            self.after(0, lambda: (
+            self._run_on_ui("queue-refresh", lambda: (
                 self._queue_refresh_tree(),
                 self.status.config(text=f"已加入队列: {title}")))
             self._start_queue_worker()
@@ -1321,10 +1388,8 @@ class App(ttk.Window):
                 self.queue_tree.insert("", END, iid=str(i),
                                        tags=(it["status"],),
                                        values=(i + 1, status_text, name_text, progress_text, ""))
-        self.after(0, lambda d=done_count, t=total, f=failed_count: (
-            self.dl_total_label.config(text=f"总进度: {d}/{t}  ✗ {f}"),
-            self.dl_total_prog.config(value=(d / max(t, 1)) * 100),
-            self.update()))
+        self.dl_total_label.config(text=f"总进度: {done_count}/{total}  ✗ {failed_count}")
+        self.dl_total_prog.config(value=(done_count / max(total, 1)) * 100)
 
     def _show_queue_menu(self, event):
         iid = self.queue_tree.identify_row(event.y)
