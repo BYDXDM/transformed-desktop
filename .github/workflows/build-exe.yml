@@ -3,6 +3,8 @@ name: Build Windows EXE
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:
@@ -22,12 +24,25 @@ jobs:
 
     - name: Install dependencies
       run: |
-        pip install pyinstaller ttkbootstrap pillow yt-dlp mutagen ebooklib
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run offline tests
+      run: |
+        python -m py_compile main.py run.pyw download_options.py
+        python -m unittest discover -s tests -v
 
     - name: Build EXE
       shell: cmd
       run: |
         pyinstaller --onefile --windowed --name "transformed" --hidden-import ttkbootstrap --hidden-import PIL._tkinter_finder --hidden-import ebooklib --hidden-import yt_dlp --hidden-import mutagen --collect-all ttkbootstrap main.py
+
+    - name: Verify packaged EXE
+      shell: pwsh
+      run: |
+        $exe = Get-Item dist/transformed.exe -ErrorAction Stop
+        if ($exe.Length -le 0) { throw "Packaged EXE is empty" }
+        Write-Host "Built $($exe.FullName) ($($exe.Length) bytes)"
 
     - name: Upload EXE
       uses: actions/upload-artifact@v4

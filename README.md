@@ -12,7 +12,7 @@
 ## 手动运行
 
 ```bash
-pip install ttkbootstrap pillow yt-dlp mutagen ebooklib
+pip install -r requirements.txt
 python main.py
 ```
 
@@ -39,5 +39,9 @@ pyinstaller --onefile --windowed --name transformed ^
 
 ## 需要的依赖
 
-- Python 3.8+
-- ffmpeg（MP4→MP3 用）：https://ffmpeg.org/download.html
+- 当前 Windows：Python 3.10+（使用 `requirements.txt`）
+- Windows 7 兼容构建：Python 3.8（使用固定的 `requirements-win7.txt`，功能依赖版本较旧）
+- ffmpeg：https://ffmpeg.org/download.html
+  - MP4 → MP3 转换需要 ffmpeg；
+  - B 站等平台常提供分离的 DASH 视频/音频流，下载 MP4 时的合并也需要 ffmpeg；
+  - 直接下载 MP3 时的音频转码同样需要 ffmpeg。

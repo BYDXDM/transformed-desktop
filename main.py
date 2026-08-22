@@ -34,6 +34,7 @@ from datetime import datetime
 from PIL import Image, ImageTk
 import base64
 import io
+from download_options import build_download_options, prepare_url
 
 # ===== 尝试导入功能库 =====
 try:
@@ -931,34 +932,8 @@ class App(ttk.Window):
             return False, str(e)
     
     def _prepare_url(self, url):
-        """智能处理输入：支持裸 BV/AV 号、b23短链、完整链接、混合文本"""
-        url = url.strip()
-        if not url:
-            return url
-
-        # 1. 从混合文本中提取 URL（用户可能粘贴带说明的文字）
-        url_match = re.search(r'(https?://[^\s<>"\'\]]+)', url, re.IGNORECASE)
-        if url_match:
-            url = url_match.group(1).rstrip('，。！？、,.;!?')
-            return url
-
-        # 2. Bilibili BV号 (BV 后12位字母数字)，从任意位置提取
-        m = re.search(r'(BV[0-9A-Za-z]{10})', url)
-        if m:
-            return f"https://www.bilibili.com/video/{m.group(1)}"
-        # 3. AV号
-        m = re.search(r'(av\d+)', url, re.IGNORECASE)
-        if m:
-            return f"https://www.bilibili.com/video/{m.group(1)}"
-        # 4. b23.tv 短链（分享常用）
-        m = re.match(r'(b23\.tv/[0-9A-Za-z]+)', url, re.IGNORECASE)
-        if m:
-            return f"https://{m.group(1)}"
-        # 5. 无协议完整域名
-        if "." in url and re.search(r'\.[a-zA-Z]{2,}(/|$)', url):
-            return "https://" + url
-        # 6. 其他原样返回
-        return url
+        """智能处理输入：支持裸 BV/AV 号、b23短链、完整链接、混合文本。"""
+        return prepare_url(url)
 
     # ========== 下载队列相关 ==========
     _STATUS_ICONS = {
@@ -1155,55 +1130,13 @@ class App(ttk.Window):
                     self.update()))
 
         try:
-            opts = {
-                "outtmpl": str(Path(self.output_dir) / "%(title)s.%(ext)s"),
-                "quiet": True, "no_warnings": True,
-                "progress_hooks": [progress_hook],
-                "noprogress": True,
-                "retries": 5,
-                "fragment_retries": 5,
-                "socket_timeout": 30,
-                "concurrent_fragment_downloads": 4,
-                "continue": True,
-                "skip_unavailable_fragments": True,
-                "fragment_retries_base": 2,
-                "windowsfilenames": True,
-                "noplaylist": True,
-            }
-            if "bilibili" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
-                opts.update({
-                    "referer": "https://www.bilibili.com/",
-                    "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win6; x64) AppleWebKit/537.36"},
-                    "nocheckcertificate": False,
-                })
-            ffmpeg_bin = get_ffmpeg_path()
-            if ffmpeg_bin:
-                opts["ffmpeg_location"] = str(Path(ffmpeg_bin).parent)
-
-            if "bilibili.com" in ready_url or ready_url.startswith("BV") or ready_url.startswith("av"):
-                if is_mp3:
-                    opts["format"] = "ba/b"
-                    opts.update({
-                        "postprocessors": [{
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "mp3",
-                            "preferredquality": "192",
-                        }],
-                    })
-                else:
-                    opts["format"] = "bv*+ba/b"
-            else:
-                if is_mp3:
-                    opts.update({
-                        "format": "bestaudio/best",
-                        "postprocessors": [{
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "mp3",
-                            "preferredquality": "192",
-                        }],
-                    })
-                else:
-                    opts["format"] = "bv*+ba/best"
+            opts = build_download_options(
+                ready_url,
+                is_mp3=is_mp3,
+                output_dir=self.output_dir,
+                ffmpeg_path=get_ffmpeg_path(),
+                progress_hook=progress_hook,
+            )
 
             cb(0.2, "下载中...")
             with yt_dlp.YoutubeDL(opts) as ydl:
