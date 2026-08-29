@@ -8,6 +8,8 @@ import os
 from net_guard import guarded_urlopen
 
 REPO = "BYDXDM/transformed-desktop"
+# 发布始终从 master 切 tag；不指定的话 GitHub 会把新 tag 打在默认分支 HEAD 上
+BRANCH = "master"
 EXE = "dist/transformed.exe"
 TAG = "v1.4.4"
 NAME = "transformed Desktop v1.4.4"
@@ -57,8 +59,9 @@ def main():
         "User-Agent": "transformed-upload",
     }
 
-    # 1. 创建 Release
-    data = json.dumps({"tag_name": TAG, "name": NAME, "body": BODY, "draft": False, "prerelease": False}).encode()
+    # 1. 创建 Release（target_commitish 确保 tag 落在 master HEAD）
+    data = json.dumps({"tag_name": TAG, "target_commitish": BRANCH,
+                       "name": NAME, "body": BODY, "draft": False, "prerelease": False}).encode()
     req = urllib.request.Request(
         f"https://api.github.com/repos/{REPO}/releases",
         data=data, headers=headers, method="POST"
