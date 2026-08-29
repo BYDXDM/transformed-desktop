@@ -112,6 +112,26 @@ class BilibiliDownloadOptionsTests(unittest.TestCase):
 
         self.assertNotIn("ffmpeg_location", options)
 
+    def test_cookiefile_only_applies_to_bilibili(self):
+        # 已登录时 B 站下载应携带 cookiefile；其他平台不受影响
+        options = build_download_options(
+            "https://www.bilibili.com/video/BV1ktMr6CEUF",
+            is_mp3=False,
+            output_dir=Path("downloads"),
+            ffmpeg_path=None,
+            cookiefile=r"C:\Users\x\.transformed_cookies.txt",
+        )
+        self.assertEqual(options["cookiefile"], r"C:\Users\x\.transformed_cookies.txt")
+
+        options = build_download_options(
+            "https://www.youtube.com/watch?v=test",
+            is_mp3=False,
+            output_dir=Path("downloads"),
+            ffmpeg_path=None,
+            cookiefile=r"C:\Users\x\.transformed_cookies.txt",
+        )
+        self.assertNotIn("cookiefile", options)
+
     def test_no_merge_format_for_audio_only(self):
         # 纯音频走 FFmpegExtractAudio 后处理器，无需 merge_output_format
         options = build_download_options(

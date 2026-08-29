@@ -5,3 +5,5 @@ pillow==12.3.0
 yt-dlp==2026.7.4
 mutagen==1.48.1
 ebooklib==0.20
+tkinterdnd2==0.4.2
+qrcode==7.4.2

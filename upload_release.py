@@ -11,17 +11,18 @@ REPO = "BYDXDM/transformed-desktop"
 # 发布始终从 master 切 tag；不指定的话 GitHub 会把新 tag 打在默认分支 HEAD 上
 BRANCH = "master"
 EXE = "dist/transformed.exe"
-TAG = "v1.5.0"
-NAME = "transformed Desktop v1.5.0"
-BODY = """## transformed Desktop v1.5.0
+TAG = "v1.6.0"
+NAME = "transformed Desktop v1.6.0"
+BODY = """## transformed Desktop v1.6.0
 
 ### 新功能
-- ⚙ 设置持久化：输出目录、下载格式（MP4/MP3）、深浅色主题在重启后自动记住
-- 📋 一键粘贴：链接框新增剪贴板粘贴按钮
-- 🌙/☀ 深色 / 浅色主题一键切换
-- 🎧 MP4 转 MP3 显示真实转换进度（此前只有估算进度）
-- 📂 双击历史记录直接打开对应的输出文件
-- 🆕 启动时静默检查新版本（每 24 小时一次），有新版会在状态栏提示
+- ⚡ 并行下载：下载队列支持 1~3 并发（默认 2），批量下载更快，底部进度条为聚合进度
+- 🖱 拖拽导入：把文件拖进窗口自动进入对应转换卡片（EPUB/视频/图片），拖入链接自动进下载框
+- 🔑 B站扫码登录：用 B 站 APP 扫码后，B 站视频可下载更高清晰度；登录凭据仅保存在本机，一键可退出
+- 🎵 MP4 转 MP3 显示真实转换进度
+
+### v1.5.0 功能回顾
+- 设置持久化（输出目录/格式/主题）、剪贴板一键粘贴、深浅色主题切换、双击历史打开文件、静默检查更新
 
 ### 使用方式
 双击 transformed.exe 即可，无需 Python 环境。MP4转MP3 与部分视频合并需要 ffmpeg，程序可自动下载。

@@ -57,6 +57,45 @@ def is_newer_version(remote, current):
     return rp > cp
 
 
+def parse_drop_list(data):
+    """解析 tkdnd 拖放数据（Tcl list 格式）为字符串列表。
+
+    不能用 tk.splitlist：它会把 Windows 路径里的 \\a、\\t、\\n 当 Tcl 转义符，
+    导致 "D:\\ai\\test" 这类路径被静默损坏。此实现按空白分词、
+    支持 {} 与 "" 包含空格的路径，反斜杠原样保留。
+    """
+    text = str(data)
+    items, cur = [], []
+    i, n = 0, len(text)
+    in_quote = False
+    while i < n:
+        ch = text[i]
+        if ch == "{" and not in_quote:
+            depth = 1
+            i += 1
+            start = i
+            while i < n and depth:
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                i += 1
+            cur.append(text[start:i - 1])
+            continue
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch in " \t\n" and not in_quote:
+            if cur:
+                items.append("".join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    if cur:
+        items.append("".join(cur))
+    return items
+
+
 def compute_queue_move(n, selected, direction, blocked=()):
     """Compute a one-step queue move for a multi-selection.
 

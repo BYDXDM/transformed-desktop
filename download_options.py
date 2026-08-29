@@ -43,7 +43,8 @@ def is_bilibili_url(url):
             or lower_url.startswith("bv") or lower_url.startswith("av"))
 
 
-def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_hook=None):
+def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_hook=None,
+                           cookiefile=None):
     """Build yt-dlp options without performing network or filesystem I/O."""
     options = {
         "outtmpl": str(Path(output_dir) / "%(title)s.%(ext)s"),
@@ -70,6 +71,9 @@ def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_h
             "nocheckcertificate": False,
             "format": "ba/b" if is_mp3 else "bv*+ba/b",
         })
+        if cookiefile:
+            # 已登录时携带 Cookie，可下载更高清晰度（仅 B 站域名使用）
+            options["cookiefile"] = str(cookiefile)
     elif is_mp3:
         options["format"] = "bestaudio/best"
     else:

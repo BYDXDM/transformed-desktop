@@ -20,6 +20,8 @@ def ensure_deps():
         "yt_dlp": "yt-dlp",
         "ebooklib": "ebooklib",
         "mutagen": "mutagen",
+        "tkinterdnd2": "tkinterdnd2",
+        "qrcode": "qrcode",
     }
     missing = [pkg for mod, pkg in needs.items() if not _import_ok(mod)]
     if missing:

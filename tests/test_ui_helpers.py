@@ -5,6 +5,7 @@ from ui_helpers import (
     UiProgressEventQueue,
     compute_queue_move,
     is_newer_version,
+    parse_drop_list,
     selected_history_ids,
 )
 
@@ -73,6 +74,32 @@ class IsNewerVersionTests(unittest.TestCase):
     def test_short_versions_pad_for_comparison(self):
         self.assertTrue(is_newer_version("v1.5", "v1.4.9"))
         self.assertFalse(is_newer_version("v1", "v1.0.1"))
+
+
+class ParseDropListTests(unittest.TestCase):
+    def test_bare_paths_preserve_backslashes(self):
+        # Tcl splitlist 会把 \a \t 当转义符；这里必须原样保留
+        self.assertEqual(
+            parse_drop_list(r"D:\ai\test\drop_demo.png"),
+            [r"D:\ai\test\drop_demo.png"],
+        )
+
+    def test_braced_paths_with_spaces(self):
+        self.assertEqual(
+            parse_drop_list("{C:/my files/a b.mp4} {D:/x.epub}"),
+            ["C:/my files/a b.mp4", "D:/x.epub"],
+        )
+
+    def test_mixed_files_and_links(self):
+        self.assertEqual(
+            parse_drop_list(r"D:\ai\书.epub https://b23.tv/abc123"),
+            [r"D:\ai\书.epub", "https://b23.tv/abc123"],
+        )
+
+    def test_empty_and_multiple_spaces(self):
+        self.assertEqual(parse_drop_list("   "), [])
+        self.assertEqual(parse_drop_list("  a   b  "), ["a", "b"])
+        self.assertEqual(parse_drop_list(""), [])
 
 
 class ComputeQueueMoveTests(unittest.TestCase):

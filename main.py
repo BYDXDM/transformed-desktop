@@ -35,30 +35,25 @@ from ui_helpers import (
     selected_history_ids,
     compute_queue_move,
     is_newer_version,
+    parse_drop_list,
 )
 from net_guard import guarded_urlopen
-
-APP_VERSION = "v1.5.0"
-UI_FONT = "Microsoft YaHei UI"
-
-# 深浅色主题对应的自绘控件颜色（ttk 部件由主题自动适配）。
-# btn = 切换按钮的文字（描述点击后将切到的目标主题）
-THEMES = {
-    "superhero": {
-        "btn": "🌙 深色",
-        "bg": "#1a1a2e", "fg": "#e0e0e0", "ph": "#667788",
-        "zebra_odd": "#223140", "zebra_even": "#2b3e50",
-        "q_tags": {"waiting": "#8899aa", "downloading": "#00ccff",
-                   "done": "#44cc44", "failed": "#ff5555", "retrying": "#ffaa00"},
-    },
-    "flatly": {
-        "btn": "☀ 浅色",
-        "bg": "#ffffff", "fg": "#212529", "ph": "#95a5a6",
-        "zebra_odd": "#eef2f5", "zebra_even": "#ffffff",
-        "q_tags": {"waiting": "#6c7a89", "downloading": "#0b76b8",
-                   "done": "#1e9e33", "failed": "#d32f2f", "retrying": "#d48806"},
-    },
-}
+from app_common import (
+    APP_VERSION, UI_FONT, THEMES, HISTORY_FILE, LOG_FILE,
+    Logger, History, AppSettings, _validated_output_file,
+)
+from ffmpeg_tools import download_ffmpeg, get_ffmpeg_path, media_duration
+from bili_api import (
+    check_foreign_access,
+    search_bilibili_songs,
+    bili_cookies_exist,
+    bili_logout,
+    bili_user_id,
+    generate_login_qr,
+    wait_login_qr,
+    BILI_COOKIEFILE,
+)
+import converters
 
 # ===== 尝试导入功能库 =====
 try:
@@ -73,422 +68,18 @@ try:
 except ImportError:
     HAS_EBOOKLIB = False
 
-# ===== 配置 =====
-HISTORY_FILE = Path.home() / ".transformed_history.json"
-LOG_FILE = Path.home() / ".transformed_log.txt"
-SETTINGS_FILE = (Path.home() / ".transformed_settings.json").resolve()
+try:
+    import qrcode
+    HAS_QRCODE = True
+except ImportError:
+    HAS_QRCODE = False
 
-
-class AppSettings:
-    """轻量设置持久化（输出目录/下载格式/主题等），损坏时回退默认值。"""
-    DEFAULTS = {
-        "output_dir": "",
-        "dl_type": "mp4",
-        "theme": "superhero",
-        "update_last_check": 0.0,
-    }
-    _lock = threading.Lock()
-
-    def __init__(self, path=SETTINGS_FILE):
-        self.path = Path(path)
-        self.data = dict(self.DEFAULTS)
-        self.load()
-
-    def load(self):
-        try:
-            if self.path.exists():
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(raw, dict):
-                    self.data.update({k: raw[k] for k in self.DEFAULTS if k in raw})
-        except Exception:
-            pass
-
-    def save(self):
-        with self._lock:
-            try:
-                target = _validated_output_file(self.path, Path.home())
-                Path(target).write_text(
-                    json.dumps(self.data, indent=2, ensure_ascii=False),
-                    encoding="utf-8")
-            except Exception:
-                pass
-
-    def get(self, key):
-        return self.data.get(key, self.DEFAULTS.get(key))
-
-    def set(self, key, value):
-        self.data[key] = value
-        self.save()
-
-
-def _validated_output_file(path, base):
-    """规范化目标路径并确保其位于 base 目录内，防止路径穿越。"""
-    base = Path(base).resolve()
-    target = Path(path).resolve()
-    if target != base and base not in target.parents:
-        raise ValueError(f"拒绝写入 {base} 之外的路径: {target}")
-    return target
-
-# ===== ffmpeg 管理 =====
-import ipaddress
-import socket
-
-
-def _assert_public_http_url(url):
-    """仅允许 http/https，且主机必须解析到公网地址。
-
-    阻断环回、私有、链路本地、保留、组播地址，防止请求被导向内网或本机服务。
-    """
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"不支持的协议: {parsed.scheme}")
-    host = parsed.hostname
-    if not host:
-        raise ValueError("URL 缺少主机名")
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
-        ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
-            raise ValueError(f"拒绝访问非公网地址: {host} -> {ip}")
-
-
-class _GuardedRedirectHandler(_urlreq.HTTPRedirectHandler):
-    """重定向目标同样经过公网校验，防止 30x 跳转到内网。"""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _assert_public_http_url(newurl)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
-
-
-_GUARDED_OPENER = None
-_GUARDED_OPENER_LOCK = threading.Lock()
-
-
-def guarded_urlopen(req, timeout):
-    """带 SSRF 防护的 urlopen：校验协议/主机/解析后的 IP，并拦截危险重定向。"""
-    global _GUARDED_OPENER
-    url = req.full_url if isinstance(req, _urlreq.Request) else req
-    _assert_public_http_url(url)
-    with _GUARDED_OPENER_LOCK:
-        if _GUARDED_OPENER is None:
-            _GUARDED_OPENER = _urlreq.build_opener(_GuardedRedirectHandler())
-    return _GUARDED_OPENER.open(req, timeout=timeout)
-
-
-def safe_extractall(zf, dest):
-    """防 Zip Slip：拒绝绝对路径或包含 .. 的压缩条目再解压。"""
-    dest = Path(dest).resolve()
-    for member in zf.infolist():
-        target = (dest / member.filename).resolve()
-        try:
-            target.relative_to(dest)
-        except ValueError:
-            raise ValueError(f"压缩包内含非法路径，已拒绝解压: {member.filename}")
-    zf.extractall(dest)
-
-
-def get_ffmpeg_dir():
-    """ffmpeg 安装目录：优先 exe 同目录，其次用户目录"""
-    # exe 打包后 __file__ 是临时解压目录，用 sys.executable 的目录
-    exe_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent
-    return exe_dir / "ffmpeg"
-
-def get_ffmpeg_path():
-    """查找可用的 ffmpeg"""
-    # 1. 系统 PATH
-    found = shutil.which("ffmpeg")
-    if found:
-        return found
-    # 2. 随 exe 分发
-    candidates = [
-        get_ffmpeg_dir() / "bin" / "ffmpeg.exe",
-        get_ffmpeg_dir() / "bin" / "ffmpeg",
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return None
-
-def download_ffmpeg(progress_cb=None):
-    """自动下载 ffmpeg for Windows"""
-    if os.name != "nt":
-        return False, "ffmpeg 自动下载仅支持 Windows，请手动安装"
-
-    url = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/"
-           "latest/ffmpeg-master-latest-win64-gpl-shared.zip")
-
-    dest = get_ffmpeg_dir()
-    dest.mkdir(parents=True, exist_ok=True)
-    zip_path = _validated_output_file(dest / "ffmpeg.zip", dest)
-    extract_dir = dest / "_extract"
-
-    try:
-        progress_cb and progress_cb("正在下载 ffmpeg (约30MB)...")
-        # 带超时+进度+公网校验的流式下载，替代无超时、易永久卡死的 urlretrieve
-        req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        buf = bytearray()
-        with guarded_urlopen(req, timeout=60) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            while True:
-                chunk = resp.read(256 * 1024)
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                if total:
-                    progress_cb and progress_cb(
-                        f"正在下载 ffmpeg... {len(buf) / 1048576:.1f}/{total / 1048576:.1f} MB")
-        zip_path = _validated_output_file(dest / "ffmpeg.zip", dest)
-        Path(zip_path).write_bytes(bytes(buf))
-
-        progress_cb and progress_cb("正在解压...")
-        import zipfile
-        with zipfile.ZipFile(zip_path) as z:
-            # 解压到临时目录（防 Zip Slip），再移动 bin/ 内容
-            extract_dir.mkdir(exist_ok=True)
-            safe_extractall(z, extract_dir)
-
-        # 找到 bin 目录（解压出来可能是 ffmpeg-master-latest-win64-gpl-shared/）
-        bin_dir = None
-        for d in extract_dir.iterdir():
-            b = d / "bin"
-            if b.exists():
-                bin_dir = b
-                break
-
-        if not bin_dir:
-            return False, "ffmpeg 压缩包结构异常，未找到 bin 目录"
-
-        # 移动 ffmpeg.exe 到我们的 ffmpeg/bin/
-        target = dest / "bin"
-        target.mkdir(exist_ok=True)
-        for f in bin_dir.iterdir():
-            shutil.copy2(f, target / f.name)
-
-        if not get_ffmpeg_path():
-            return False, "ffmpeg 解压完成但未找到可执行文件"
-
-        return True, str(get_ffmpeg_path())
-    except Exception as e:
-        return False, f"ffmpeg 下载失败: {e}"
-    finally:
-        # 无论成败都清理临时文件（半截 zip / 解压目录）
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        try:
-            zip_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-# ===== 工具类 =====
-import urllib.request as _urlreq
-import urllib.parse
-
-_FOREIGN_CACHE = {"ts": 0.0, "ok": False, "reason": ""}
-_FOREIGN_CACHE_TTL = 600  # 检测结果缓存 10 分钟，避免每个外网任务都等 5 秒探测
-
-
-def check_foreign_access():
-    """检测当前网络能否访问外网(YouTube等)。返回 (bool, 信息)
-    - 能访问外网: (True, 描述)
-    - 不能(需代理): (False, 原因描述)
-    """
-    import time
-    now = time.time()
-    if now - _FOREIGN_CACHE["ts"] < _FOREIGN_CACHE_TTL:
-        return _FOREIGN_CACHE["ok"], _FOREIGN_CACHE["reason"]
-
-    result = None
-    # 通过 ipinfo 获取出口 IP 归属地
-    try:
-        req = _urlreq.Request("https://ipinfo.io/json",
-                             headers={"User-Agent": "Mozilla/5.0"})
-        with guarded_urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode())
-            country = data.get("country", "")
-            ip = data.get("ip", "?")
-            if country == "CN":
-                result = (False, f"当前 IP({ip})归属中国，直连外网受限，下载 YouTube/X 需代理")
-            else:
-                result = (True, f"当前 IP({ip}) 非中国归属，可访问外网")
-    except Exception:
-        # ipinfo 都连不上，尝试直接测 youtube 连通性
-        try:
-            req = _urlreq.Request("https://www.youtube.com",
-                                 headers={"User-Agent": "Mozilla/5.0"})
-            with guarded_urlopen(req, timeout=5) as r:
-                result = (True, "可访问外网(YouTube可达)")
-        except Exception:
-            result = (False, "无法访问外网(YouTube不可达)，可能需要代理")
-
-    _FOREIGN_CACHE.update({"ts": now, "ok": result[0], "reason": result[1]})
-    return result
-
-
-def _get_buvid3():
-    """从 B 站指纹接口获取真实 buvid3（硬编码假值会被 412 风控拦截）"""
-    try:
-        req = _urlreq.Request(
-            "https://api.bilibili.com/x/frontend/finger/spi",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            })
-        with guarded_urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        b_3 = (data.get("data") or {}).get("b_3", "")
-        if b_3:
-            return b_3
-    except Exception as e:
-        Logger.log(f"获取 buvid3 失败: {e}")
-    return None
-
-
-def search_bilibili_song(query):
-    """从 B 站搜索视频（歌曲），返回第一个结果的视频链接；无结果返回 None。
-    用 B 站官方搜索接口（免签）。先获取真实 buvid3 再请求，绕过 412 风控。"""
-    results = search_bilibili_songs(query, limit=1)
-    return results[0]["url"] if results else None
-
-
-def search_bilibili_songs(query, limit=6):
-    """从 B 站搜索视频（歌曲），返回结果列表 [{bvid, title, author, duration, url}]。
-    自动过滤翻唱、伴奏、纯音乐等非原唱结果。"""
-    results = []
-    try:
-        enc = urllib.parse.quote(query)
-        buvid3 = _get_buvid3()
-        cookie = f"buvid3={buvid3}" if buvid3 else "buvid3=infoc"
-        req = _urlreq.Request(
-            f"https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword={enc}",
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Referer": "https://www.bilibili.com/",
-                "Cookie": cookie,
-            })
-        with guarded_urlopen(req, timeout=8) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        if data.get("code") != 0:
-            Logger.log(f"B站搜索被拒 code={data.get('code')}: {data.get('message','')}")
-            return results
-        raw = data.get("data", {}).get("result", [])
-        # 过滤关键词
-        skip_kw = ("翻唱", "cover", "伴奏", "纯音乐", "inst", "karaoke", "MV", "现场", "live")
-        for item in raw:
-            if not isinstance(item, dict) or item.get("type") != "video":
-                continue
-            bvid = item.get("bvid", "")
-            if not bvid:
-                continue
-            title = re.sub(r"</?em[^>]*>", "", item.get("title", "")).strip()
-            author = item.get("author", "")
-            duration = item.get("duration", "")
-            # 过滤非原唱
-            tl = title.lower()
-            if any(kw in tl for kw in skip_kw):
-                continue
-            results.append({
-                "bvid": bvid,
-                "title": title,
-                "author": author,
-                "duration": duration,
-                "url": f"https://www.bilibili.com/video/{bvid}",
-            })
-            if len(results) >= limit:
-                break
-        Logger.log(f"B站搜索 '{query}' → {len(results)} 条结果")
-    except Exception as e:
-        Logger.log(f"B站搜索异常: {e}")
-    return results
-
-# 日志线程锁：防止多线程并发写/裁剪造成竞态
-_LOG_LOCK = threading.Lock()
-_LOG_MAX = 500   # 日志行数上限
-
-class Logger:
-    @staticmethod
-    def log(msg):
-        ts = datetime.now().strftime("%m-%d %H:%M:%S")
-        entry = f"[{ts}] {msg}"
-        try:
-            with _LOG_LOCK:
-                with open(LOG_FILE, "a", encoding="utf-8") as f:
-                    f.write(entry + "\n")
-                Logger._trim()
-        except:
-            pass
-        return entry
-
-    @staticmethod
-    def _trim():
-        """日志超 _LOG_MAX 行时裁剪到 _LOG_MAX-100 行，避免无限增长。
-        加锁保护，避免多线程并发裁剪互相覆盖。"""
-        try:
-            log_file = _validated_output_file(LOG_FILE, Path.home())
-            lines = Path(log_file).read_text(encoding="utf-8").splitlines(keepends=True)
-            if len(lines) > _LOG_MAX:
-                Path(log_file).write_text(
-                    "".join(lines[-(_LOG_MAX - 100):]), encoding="utf-8")
-        except:
-            pass
-    
-    @staticmethod
-    def read():
-        if LOG_FILE.exists():
-            try:
-                with open(LOG_FILE, "r", encoding="utf-8") as f:
-                    return f.read().splitlines()
-            except:
-                return []
-        return []
-
-class History:
-    # 工作线程(add)与 UI 线程(删除/清空)都会写入，用 RLock 防止并发写坏 JSON。
-    # 所有写入统一经由 add/delete/clear 持锁后调用 save()（RLock 可重入）。
-    _lock = threading.RLock()
-
-    def __init__(self):
-        self.items = []
-        self.load()
-    
-    def load(self):
-        if HISTORY_FILE.exists():
-            try:
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                    self.items = json.load(f)
-            except:
-                self.items = []
-    
-    def save(self):
-        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        target = _validated_output_file(HISTORY_FILE, Path.home())
-        Path(target).write_text(
-            json.dumps(self.items[-500:], indent=2, ensure_ascii=False),
-            encoding="utf-8")
-    
-    def add(self, name, typ, ok, out=""):
-        with self._lock:
-            self.items.append({
-                "time": datetime.now().strftime("%m-%d %H:%M"),
-                "name": name, "type": typ,
-                "ok": ok, "out": out
-            })
-            self.save()
-
-    def delete(self, indexes):
-        """按原始索引批量删除记录（倒序删除避免索引位移），返回实际删除数"""
-        removed = 0
-        with self._lock:
-            for idx in sorted(indexes, reverse=True):
-                if 0 <= idx < len(self.items):
-                    del self.items[idx]
-                    removed += 1
-            self.save()
-        return removed
-
-    def clear(self):
-        with self._lock:
-            self.items = []
-            self.save()
-
+try:
+    from tkinterdnd2 import DND_FILES, DND_TEXT
+    HAS_DND = True
+except ImportError:
+    DND_FILES = DND_TEXT = None
+    HAS_DND = False
 
 # ===== 主应用 =====
 def get_asset(name):
@@ -521,14 +112,18 @@ class App(ttk.Window):
             self.output_dir = saved_dir
 
         # ===== 下载队列 =====
-        self.dl_queue = []           # [{url, is_mp3, status, name, error}, ...]
+        self.dl_queue = []           # [{uid, url, is_mp3, status, name, error}, ...]
         self.dl_queue_lock = threading.Lock()
-        self.dl_queue_worker_running = False
+        self._uid_seq = 0
+        self._active_workers = 0     # 正在运行的下载 worker 数
         self._ui_thread_id = threading.get_ident()
         self._ui_closing = False
-        self.dl_current_item = None  # 当前正在下载的队列项引用
         self._url_placeholder_active = True
-        self._dl_pct = 0.0
+        self._dl_pcts = {}           # uid -> 单调递增显示进度(0~1)
+        try:
+            self.max_parallel = max(1, min(3, int(self.settings.get("parallel") or 2)))
+        except (TypeError, ValueError):
+            self.max_parallel = 2
         self._progress_events = UiProgressEventQueue()
 
         # 两侧看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
@@ -540,6 +135,8 @@ class App(ttk.Window):
 
         self._build_ui()
         self._apply_theme_colors()
+        self._setup_dragdrop()
+        self._update_bili_btn()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._ui_drain_after_id = self.after(50, self._drain_progress_events)
         self._check_deps()
@@ -710,7 +307,7 @@ class App(ttk.Window):
     
     def _build_left(self, parent):
         """左侧功能面板"""
-        nb = ttk.Notebook(parent)
+        self.nb = nb = ttk.Notebook(parent)
         nb.pack(fill=BOTH, expand=True)
         
         # --- Tab 1: 格式转换 ---
@@ -765,8 +362,13 @@ class App(ttk.Window):
         url_box = ttk.Labelframe(tab2, text="🎬 视频链接下载（支持批量）", padding=12)
         url_box.pack(fill=X, pady=(0, 8))
 
-        ttk.Label(url_box, text="每行一个链接，支持 B站/BV号/AV号/b23短链/YouTube/X/直链",
-                 font=(UI_FONT, 9), bootstyle="secondary").pack(anchor=W, pady=(0, 4))
+        head = ttk.Frame(url_box)
+        head.pack(fill=X, pady=(0, 4))
+        ttk.Label(head, text="每行一个链接，支持 B站/BV号/AV号/b23短链/YouTube/X/直链",
+                 font=(UI_FONT, 9), bootstyle="secondary").pack(side=LEFT)
+        self.bili_btn = ttk.Button(head, text="🔑 B站登录", width=11,
+                                   command=self._bili_login, bootstyle="outline")
+        self.bili_btn.pack(side=RIGHT)
 
         # 多行文本输入框
         self.url_text = tk.Text(url_box, height=4, font=(UI_FONT, 10),
@@ -853,6 +455,13 @@ class App(ttk.Window):
                   command=self._queue_delete_selected).pack(side=LEFT, padx=2)
         ttk.Button(q_btns, text="清空队列", bootstyle="danger",
                   command=self._queue_clear).pack(side=RIGHT, padx=2)
+        ttk.Label(q_btns, text="并发", font=(UI_FONT, 9),
+                 bootstyle="secondary").pack(side=RIGHT, padx=(8, 2))
+        self.parallel_var = tk.StringVar(value=str(self.max_parallel))
+        parallel_box = ttk.Combobox(q_btns, textvariable=self.parallel_var,
+                                    values=("1", "2", "3"), width=3, state="readonly")
+        parallel_box.pack(side=RIGHT)
+        parallel_box.bind("<<ComboboxSelected>>", self._on_parallel_change)
 
         # ---- 进度区 ----
         prog_box = ttk.Labelframe(tab2, text="📊 下载进度", padding=8)
@@ -897,7 +506,17 @@ class App(ttk.Window):
         self.log_text = scrolledtext.ScrolledText(tab3, height=15,
             font=("Consolas", 9), bg="#1a1a2e", fg="#e0e0e0")
         self.log_text.pack(fill=BOTH, expand=True, pady=5)
-    
+
+    def _on_parallel_change(self, event=None):
+        """调整并行下载并发数（立即生效：增加时补齐 worker）"""
+        try:
+            self.max_parallel = max(1, min(3, int(self.parallel_var.get())))
+        except ValueError:
+            self.max_parallel = 2
+        self.settings.set("parallel", self.max_parallel)
+        self._ensure_workers()
+        self.status.config(text=f"下载并发已设为 {self.max_parallel}")
+
     def _make_converter_card(self, parent, title, key, desc, pick_fn, conv_fn):
         """创建转换卡片（带标题的分组框）"""
         icons = {"epub": "📖", "mp4": "🎬", "webp": "🖼️"}
@@ -1067,6 +686,159 @@ class App(ttk.Window):
                 self.settings.set("update_last_check", time.time())
 
         threading.Thread(target=run, daemon=True).start()
+
+    # ---- 拖拽导入（可选依赖 tkinterdnd2） ----
+    _CONVERT_EXTS = {
+        "epub": (".epub",),
+        "mp4": (".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts"),
+        "webp": (".webp", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"),
+    }
+
+    def _setup_dragdrop(self):
+        """注册拖放：本地文件按扩展名进转换卡片，链接文本进 URL 输入框"""
+        if not HAS_DND:
+            Logger.log("拖拽支持未启用：未安装 tkinterdnd2（可选依赖）")
+            return
+        try:
+            import tkinterdnd2
+            tkinterdnd2.TkinterDnD._require(self)
+            self.drop_target_register(DND_FILES, DND_TEXT)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+            Logger.log("拖拽支持已启用")
+        except Exception as e:
+            Logger.log(f"注册拖放失败: {e}")
+
+    def _on_drop(self, event):
+        # 不用 tk.splitlist：它会把 Windows 路径里的 \a、\t 等当 Tcl 转义符
+        try:
+            items = parse_drop_list(event.data)
+        except Exception:
+            items = [str(event.data)]
+        files = links = unsupported = 0
+        link_lines = []
+        for raw in items:
+            path = raw.strip("{} ").strip()
+            if path and Path(path).is_file():
+                ext = Path(path).suffix.lower()
+                for key, exts in self._CONVERT_EXTS.items():
+                    if ext in exts:
+                        card = self.convert_cards[key]
+                        card["files"].append(path)
+                        card["label"].config(text=f"已选 {len(card['files'])} 个文件")
+                        files += 1
+                        break
+                else:
+                    unsupported += 1
+            elif path:
+                link_lines.append(path)
+                links += 1
+        if link_lines:
+            if self._url_placeholder_active:
+                self._on_url_text_focus_in()
+            self.url_text.insert(tk.END, "\n".join(link_lines) + "\n")
+            self.url_text.see(tk.END)
+        if files:
+            self._show_tab(0)
+            note = f"，跳过 {unsupported} 个不支持的文件" if unsupported else ""
+            self.status.config(text=f"已导入 {files} 个文件到转换列表{note}")
+        elif links:
+            self._show_tab(1)
+            self.status.config(text="已从拖拽导入链接")
+
+    def _show_tab(self, index):
+        """切换左侧功能面板到指定标签页"""
+        try:
+            self.nb.select(index)
+        except Exception:
+            pass
+
+    # ---- B 站扫码登录 ----
+    def _update_bili_btn(self):
+        if bili_cookies_exist():
+            uid = bili_user_id()
+            self.bili_btn.config(text=f"🚪 退出{uid}" if uid else "🚪 退出登录")
+        else:
+            self.bili_btn.config(text="🔑 B站登录")
+
+    def _bili_login(self):
+        """已登录 → 询问退出；未登录 → 后台获取二维码并弹出扫码窗口"""
+        if bili_cookies_exist():
+            if messagebox.askyesno("退出登录", "确定退出 B 站登录？\n将删除本机保存的登录凭据。"):
+                bili_logout()
+                self._update_bili_btn()
+                self.status.config(text="已退出 B 站登录")
+            return
+        if not HAS_QRCODE:
+            self.show_toast("缺少依赖", "扫码登录需要 qrcode 库：\npip install qrcode", "warning")
+            return
+        self.status.config(text="正在获取 B 站登录二维码...")
+        threading.Thread(target=self._bili_login_thread, daemon=True).start()
+
+    def _bili_login_thread(self):
+        qrcode_key, qr_url = generate_login_qr()
+        if not qrcode_key:
+            self._run_on_ui("bili-login", lambda: self.status.config(text="获取二维码失败"))
+            self.show_toast("失败", "获取登录二维码失败，请稍后重试", "error", _from_thread=True)
+            return
+        try:
+            img = qrcode.make(qr_url, box_size=6)
+        except Exception as e:
+            self.show_toast("失败", f"生成二维码失败: {e}", "error", _from_thread=True)
+            return
+        self._run_on_ui("bili-login", lambda: self._show_login_dlg(img, qrcode_key))
+
+    def _show_login_dlg(self, qr_img, qrcode_key):
+        dlg = tk.Toplevel(self)
+        dlg.title("B 站扫码登录")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="请用 B 站 APP 扫描二维码登录",
+                  font=(UI_FONT, 11, "bold")).pack(padx=16, pady=(14, 6))
+        photo = ImageTk.PhotoImage(qr_img)
+        self._qr_photo = photo  # 持引用，防止被 GC 后图片消失
+        ttk.Label(dlg, image=photo).pack(padx=16, pady=4)
+        status_lbl = ttk.Label(dlg, text="等待扫码…", bootstyle="secondary")
+        status_lbl.pack(padx=16, pady=(2, 4))
+        ttk.Label(dlg, text="登录凭据仅保存在本机；登录后 B 站视频可下载更高清晰度",
+                  font=(UI_FONT, 8), bootstyle="secondary").pack(padx=16, pady=(0, 8))
+
+        stop_event = threading.Event()
+
+        def close():
+            stop_event.set()
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(dlg, text="取消", bootstyle="secondary", command=close).pack(pady=(0, 12))
+        dlg.protocol("WM_DELETE_WINDOW", close)
+
+        def ui_status(msg):
+            self._run_on_ui("bili-login", lambda m=msg: self._safe_lbl(status_lbl, m))
+
+        def worker():
+            ok, cookies, msg = wait_login_qr(qrcode_key, status_cb=ui_status,
+                                             stop_event=stop_event)
+            def finish():
+                if ok:
+                    self._update_bili_btn()
+                    self.status.config(text="✅ B 站登录成功")
+                    self.show_toast("成功", "B 站登录成功，之后下载 B 站视频可获取更高清晰度", "success")
+                elif msg != "已取消":
+                    self.show_toast("未完成", msg, "warning")
+            self._run_on_ui("bili-login", finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _safe_lbl(lbl, text):
+        try:
+            lbl.config(text=text)
+        except tk.TclError:
+            pass
     
     def _pick(self, key, filetypes):
         ct = self.convert_cards[key]
@@ -1111,9 +883,9 @@ class App(ttk.Window):
         total = len(files)
         
         conv_map = {
-            "epub": ("EPUB→TXT", self._conv_epub),
-            "mp4": ("MP4→MP3", self._conv_mp4),
-            "webp": ("WebP→JPG", self._conv_webp),
+            "epub": ("EPUB→TXT", converters.conv_epub),
+            "mp4": ("MP4→MP3", converters.conv_mp4),
+            "webp": ("WebP→JPG", converters.conv_webp),
         }
         
         typ_name, conv_fn = conv_map[key]
@@ -1167,111 +939,6 @@ class App(ttk.Window):
                 self._log_refresh()))
             skip_note = f"（跳过 {skipped_count} 个已是目标格式的文件）" if skipped_count else ""
             self.show_toast("完成", f"批量 {typ_name} 转换完成{skip_note}!\n保存至: {self.output_dir}", "success", _from_thread=True)
-    
-    def _conv_epub(self, path, out_dir, cb):
-        if not HAS_EBOOKLIB:
-            return False, "请安装: pip install ebooklib"
-        try:
-            cb(0.1, "读取 EPUB...")
-            book = epub.read_epub(path)
-            name = Path(path).stem
-            out = Path(out_dir) / f"{name}.txt"
-            texts = []
-            items = list(book.get_items_of_type(epub.ITEM_DOCUMENT))
-            for i, item in enumerate(items):
-                html = item.get_body_content().decode("utf-8", errors="replace")
-                text = re.sub(r'<[^>]+>', ' ', html)
-                import html as html_mod
-                text = html_mod.unescape(text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                if text: texts.append(text)
-                cb(0.1 + (i/len(items))*0.8, f"解析 {i+1}/{len(items)}")
-            cb(0.9, "写入文件...")
-            out = _validated_output_file(out, out_dir)
-            Path(out).write_text("\n\n".join(texts), encoding="utf-8")
-            cb(1.0, "完成")
-            return True, str(out)
-        except Exception as e:
-            return False, str(e)
-    
-    @staticmethod
-    def _media_duration(ffmpeg, path, no_window):
-        """用 ffprobe 读取媒体时长（秒），失败返回 None"""
-        ffprobe = Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
-        if not ffprobe.exists():
-            return None
-        try:
-            proc = subprocess.run(
-                [str(ffprobe), "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=nw=1:nk=1", str(path)],
-                capture_output=True, shell=False, timeout=30,
-                creationflags=no_window)
-            return float(proc.stdout.decode("ascii", "replace").strip())
-        except Exception:
-            return None
-
-    def _conv_mp4(self, path, out_dir, cb):
-        ffmpeg = get_ffmpeg_path()
-        if not ffmpeg:
-            return False, "未找到 ffmpeg，请重新启动程序并选择自动下载"
-        # GUI(pythonw) 模式下防止 ffmpeg 弹出黑色控制台窗口
-        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        try:
-            cb(0.05, "读取时长...")
-            duration = self._media_duration(ffmpeg, path, no_window)
-            name = Path(path).stem
-            out = _validated_output_file(Path(out_dir) / f"{name}.mp3", out_dir)
-            cmd = [ffmpeg, "-nostdin", "-loglevel", "error",
-                   "-i", str(path), "-vn",
-                   "-acodec", "libmp3lame", "-ab", "192k",
-                   "-y", str(out)]
-            if duration:
-                cmd += ["-progress", "pipe:1"]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, shell=False,
-                                    creationflags=no_window)
-            try:
-                for line in proc.stdout:
-                    text = line.decode("ascii", "replace").strip()
-                    # out_time_ms 单位是微秒；按已转换时长映射到 5%~95%
-                    if duration and text.startswith("out_time_ms="):
-                        try:
-                            ratio = max(0.0, min(float(text.split("=", 1)[1]) / 1e6 / duration, 1.0))
-                            cb(0.05 + ratio * 0.9, f"转换中 {ratio * 100:.0f}%")
-                        except ValueError:
-                            pass
-                proc.wait()
-            finally:
-                if proc.stdout:
-                    proc.stdout.close()
-                if proc.stderr:
-                    proc.stderr.close()
-            if proc.returncode != 0:
-                err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-300:]
-                return False, f"ffmpeg 转换失败(code={proc.returncode}): {err}"
-            if not Path(out).exists() or Path(out).stat().st_size == 0:
-                return False, "ffmpeg 未生成输出文件"
-            cb(1.0, "完成")
-            return True, str(out)
-        except Exception as e:
-            return False, str(e)
-    
-    def _conv_webp(self, path, out_dir, cb):
-        try:
-            cb(0.3, "解码...")
-            img = Image.open(path)
-            name = Path(path).stem
-            out = Path(out_dir) / f"{name}.jpg"
-            if img.mode == "RGBA":
-                bg = Image.new("RGB", img.size, (255, 255, 255))
-                bg.paste(img, mask=img.split()[3])
-                img = bg
-            cb(0.6, "编码...")
-            img.save(out, "JPEG", quality=92)
-            cb(1.0, "完成")
-            return True, str(out)
-        except Exception as e:
-            return False, str(e)
     
     def _prepare_url(self, url):
         """智能处理输入：支持裸 BV/AV 号、b23短链、完整链接、混合文本。"""
@@ -1389,8 +1056,9 @@ class App(ttk.Window):
                     skipped += 1
                     continue
                 existing.add(url)
+                self._uid_seq += 1
                 self.dl_queue.append({
-                    "url": url, "is_mp3": is_mp3,
+                    "uid": self._uid_seq, "url": url, "is_mp3": is_mp3,
                     "status": "waiting", "name": url[:80], "error": "",
                     "progress": "",
                 })
@@ -1413,34 +1081,37 @@ class App(ttk.Window):
         if not has_work:
             self.show_toast("提示", "队列中没有待下载的任务，请先添加链接", "warning")
             return
-        self._start_queue_worker()
+        self._ensure_workers()
 
-    def _start_queue_worker(self):
-        """启动队列消费线程（如果尚未运行）"""
+    def _ensure_workers(self):
+        """确保下载 worker 数量达到设置的并发数（不足则补齐，不重复启动）"""
         with self.dl_queue_lock:
-            if self.dl_queue_worker_running:
+            need = self.max_parallel - self._active_workers
+            if need <= 0:
                 return
-            self.dl_queue_worker_running = True
-        threading.Thread(target=self._queue_worker, daemon=True).start()
+            self._active_workers += need
+        for _ in range(need):
+            threading.Thread(target=self._queue_worker, daemon=True).start()
 
     def _queue_worker(self):
-        """后台线程：逐个消费队列中的 waiting 项"""
+        """后台 worker：领取 waiting/retrying 项逐个下载，队列为空时退出。
+        可同时运行 max_parallel 个 worker 实现并行下载。"""
         while True:
             item = None
             with self.dl_queue_lock:
                 for it in self.dl_queue:
                     if it["status"] in ("waiting", "retrying"):
+                        it["status"] = "downloading"
                         item = it
                         break
             if item is None:
-                # 队列空，退出 worker
+                # 队列空，本 worker 退出；最后一个退出时提示完成
                 with self.dl_queue_lock:
-                    self.dl_queue_worker_running = False
-                self._run_on_ui("queue-status", lambda: self.status.config(text="队列下载完成"))
+                    self._active_workers -= 1
+                    alive = self._active_workers
+                if alive <= 0:
+                    self._run_on_ui("queue-status", lambda: self.status.config(text="队列下载完成"))
                 return
-            with self.dl_queue_lock:
-                item["status"] = "downloading"
-                self.dl_current_item = item
             self._run_on_ui("queue-refresh", self._queue_refresh_tree)
             self._run_on_ui("queue-status", lambda n=item["name"][:40]:
                        self.status.config(text=f"正在下载: {n}"))
@@ -1450,16 +1121,20 @@ class App(ttk.Window):
                 Logger.log(f"❌ 队列项异常: {e}")
                 item["status"] = "failed"
                 item["error"] = str(e)
-            with self.dl_queue_lock:
-                self.dl_current_item = None
             self._run_on_ui("queue-refresh", self._queue_refresh_tree)
 
+    def _aggregate_dl_pct(self):
+        """所有进行中下载的平均进度(0~1)，用于底部聚合进度条"""
+        vals = list(self._dl_pcts.values())
+        return sum(vals) / len(vals) if vals else 0.0
+
     def _do_dl_item(self, item):
-        """下载单个队列项（在后台线程中执行）"""
+        """下载单个队列项（在后台线程中执行，可多线程并行）"""
         url = item["url"]
         is_mp3 = item["is_mp3"]
-        # 单调递增的显示进度(0~1)
-        self._dl_pct = 0.0
+        # 单调递增的显示进度(0~1)，按条目隔离以支持并行下载
+        uid = item["uid"]
+        self._dl_pcts[uid] = 0.0
 
         if not HAS_YTDLP:
             item["status"] = "failed"
@@ -1469,13 +1144,14 @@ class App(ttk.Window):
 
         def cb(pct, msg):
             pct = max(pct, 0.05)
-            self._dl_pct = max(self._dl_pct, pct)
-            item["progress"] = f"{self._dl_pct*100:.1f}%"
+            self._dl_pcts[uid] = max(self._dl_pcts[uid], pct)
+            item["progress"] = f"{self._dl_pcts[uid]*100:.1f}%"
+            agg = self._aggregate_dl_pct() * 100
             self._schedule_progress_ui(
                 "download",
-                lambda p=self._dl_pct, m=msg: (
+                lambda p=agg, m=msg: (
                     self.dl_prog.stop(),
-                    self.dl_prog.config(value=p * 100, mode="determinate"),
+                    self.dl_prog.config(value=p, mode="determinate"),
                     self.dl_stat.config(text=m),
                     self._queue_refresh_tree(),
                 ),
@@ -1514,12 +1190,13 @@ class App(ttk.Window):
                 eta = d.get('eta') or 0
                 if total:
                     mapped = 0.05 + (downloaded / total) * 0.90
-                    self._dl_pct = max(self._dl_pct, mapped)
-                    pct_show = self._dl_pct * 100
+                    self._dl_pcts[uid] = max(self._dl_pcts[uid], mapped)
+                    pct_show = self._dl_pcts[uid] * 100
                     item["progress"] = f"{pct_show:.1f}%"
+                    agg = self._aggregate_dl_pct() * 100
                     self._schedule_progress_ui(
                         "download",
-                        lambda p=pct_show, s=speed, e=eta: (
+                        lambda p=agg, s=speed, e=eta: (
                             self.dl_prog.stop(),
                             self.dl_prog.config(value=min(p, 100), mode="determinate"),
                             self.dl_stat.config(
@@ -1554,6 +1231,7 @@ class App(ttk.Window):
                 output_dir=self.output_dir,
                 ffmpeg_path=get_ffmpeg_path(),
                 progress_hook=progress_hook,
+                cookiefile=BILI_COOKIEFILE if BILI_COOKIEFILE.exists() else None,
             )
 
             cb(0.2, "下载中...")
@@ -1601,6 +1279,7 @@ class App(ttk.Window):
                 self.dl_prog.stop(),
                 self.dl_prog.config(value=0, mode="determinate")))
         finally:
+            self._dl_pcts.pop(uid, None)
             self._run_on_ui("download-finished", lambda: (
                 self.dl_prog.stop(),
                 self.dl_prog.config(mode="determinate"),
@@ -1640,15 +1319,16 @@ class App(ttk.Window):
             # 3. B 站无结果 → ytsearch 兜底（直接加入队列）
             url = f"ytsearch:{q}"
             with self.dl_queue_lock:
+                self._uid_seq += 1
                 self.dl_queue.append({
-                    "url": url, "is_mp3": True,
+                    "uid": self._uid_seq, "url": url, "is_mp3": True,
                     "status": "waiting", "name": f"🎵 {q}", "error": "",
                     "progress": "",
                 })
             self._run_on_ui("song-fallback", lambda: (
                 self._queue_refresh_tree(),
                 self.status.config(text=f"B站无结果，已加入 YouTube 搜索: {q}")))
-            self._start_queue_worker()
+            self._ensure_workers()
 
         threading.Thread(target=run, daemon=True).start()
 
@@ -1694,15 +1374,16 @@ class App(ttk.Window):
             title = r["title"]
             # 加入队列
             with self.dl_queue_lock:
+                self._uid_seq += 1
                 self.dl_queue.append({
-                    "url": url, "is_mp3": True,
+                    "uid": self._uid_seq, "url": url, "is_mp3": True,
                     "status": "waiting", "name": f"🎵 {title}", "error": "",
                     "progress": "",
                 })
             self._run_on_ui("queue-refresh", lambda: (
                 self._queue_refresh_tree(),
                 self.status.config(text=f"已加入队列: {title}")))
-            self._start_queue_worker()
+            self._ensure_workers()
             dlg.destroy()
             self.show_toast("已添加", f"已将 [{title}] 加入下载队列", "info")
 
@@ -1818,7 +1499,7 @@ class App(ttk.Window):
                         it["error"] = ""
                         it["progress"] = ""
         self._queue_refresh_tree()
-        self._start_queue_worker()
+        self._ensure_workers()
 
     def _queue_delete_selected(self):
         sel = self.queue_tree.selection()
