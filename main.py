@@ -162,6 +162,78 @@ def _get_buvid3():
     return None
 
 
+def _extract_bvid(url):
+    m = re.search(r"(BV[0-9A-Za-z]{10})", str(url))
+    if m:
+        return m.group(1)
+    m = re.search(r"av(\d+)", str(url), re.IGNORECASE)
+    if m:
+        return "av" + m.group(1)
+    return None
+
+
+def _api_get(url):
+    """带浏览器头的 B 站 API GET（buvid3 自动附带），返回 data 部分"""
+    buvid3 = _get_buvid3() or "infoc"
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36"),
+        "Referer": "https://www.bilibili.com/",
+        "Cookie": "buvid3=%s" % buvid3,
+    }
+    req = _urlreq.Request(url, headers=headers)
+    with guarded_urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if data.get("code") != 0:
+        raise RuntimeError("B站接口返回 code=%s: %s" % (data.get("code"), data.get("message", "")))
+    return data.get("data") or {}
+
+
+def resolve_bilibili_media(url, prefer_audio=False):
+    """绕过网页 412：直接走 view/playurl API 解析媒体直链。
+    返回 dict：kind="dash"（video_url/audio_url）或 "durl"（media_url）+ title/quality。
+    解析失败抛 RuntimeError。"""
+    bvid = _extract_bvid(url)
+    if not bvid:
+        raise RuntimeError("无法从链接中识别 B站视频 ID")
+    is_bv = bvid.startswith("BV")
+    info = _api_get("https://api.bilibili.com/x/web-interface/view?%s=%s"
+                    % ("bvid" if is_bv else "aid", bvid if is_bv else bvid[2:]))
+    title = str(info.get("title") or "bilibili")
+    cid = info.get("cid")
+    pages = info.get("pages") or []
+    if pages and pages[0].get("cid"):
+        cid = pages[0]["cid"]
+    if not cid:
+        raise RuntimeError("未获取到视频 cid")
+    play = _api_get("https://api.bilibili.com/x/player/playurl?%s=%s&cid=%s&qn=64&fnval=16"
+                    % ("bvid" if is_bv else "avid", bvid if is_bv else bvid[2:], cid))
+    dash = play.get("dash") or {}
+    durl = play.get("durl") or []
+
+    def _best(streams):
+        return max(streams, key=lambda s: (s.get("bandwidth") or 0)) if streams else None
+
+    def _u(stream):
+        return (stream or {}).get("baseUrl") or (stream or {}).get("base_url") or ""
+
+    if dash.get("video"):
+        video = _best(dash.get("video"))
+        audio = _best(dash.get("audio"))
+        if prefer_audio and audio:
+            return {"kind": "dash", "title": title, "video_url": "",
+                    "audio_url": _u(audio), "quality": "音频"}
+        return {"kind": "dash", "title": title,
+                "video_url": _u(video),
+                "audio_url": _u(audio) if audio else "",
+                "quality": "%dP" % ((video or {}).get("id") or 0) if video else ""}
+    if durl:
+        return {"kind": "durl", "title": title,
+                "media_url": durl[0].get("url", ""), "quality": "mp4"}
+    raise RuntimeError("playurl 未返回可用媒体地址")
+
+
 def search_bilibili_song(query):
     """从 B 站搜索视频（歌曲），返回第一个结果的视频链接；无结果返回 None"""
     results = search_bilibili_songs(query, limit=1)
@@ -920,6 +992,119 @@ class App(tk.Tk):
             self.dl_current_item = None
             self.after(0, self._queue_refresh_tree)
 
+    @staticmethod
+    def _run_ffmpeg_cmd(cmd):
+        """运行 ffmpeg 命令（隐藏控制台），失败抛 RuntimeError"""
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                shell=False, creationflags=no_window)
+        try:
+            proc.wait()
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+        if proc.returncode != 0:
+            err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError("ffmpeg 处理失败(code=%d): %s" % (proc.returncode, err))
+
+    def _download_bili_direct(self, item, media, is_mp3, cb):
+        """B站 API 直链下载（绕过网页 412）。失败抛异常，由调用方回退 yt-dlp。"""
+        title = re.sub(r'[\\/:*?"<>|]', "_", media["title"]).strip() or "bilibili"
+        buvid3 = _get_buvid3() or "infoc"
+        headers = {
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/120.0.0.0 Safari/537.36"),
+            "Referer": "https://www.bilibili.com/",
+            "Cookie": "buvid3=%s" % buvid3,
+        }
+        out_dir = Path(self.output_dir)
+
+        def ydl_fetch(url, lo, hi, what, tag):
+            """用 yt-dlp 通用下载器拉取 CDN 直链，进度映射到 [lo, hi]"""
+            def hook(d):
+                if d.get("status") == "downloading":
+                    total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                    if total:
+                        ratio = min(d.get("downloaded_bytes", 0) / total, 1.0)
+                        cb(lo + (hi - lo) * ratio, "%s %.0f%%" % (what, ratio * 100))
+            opts = {
+                "outtmpl": str(out_dir / ("bili_tmp_%s.%%(ext)s" % tag)),
+                "quiet": True, "no_warnings": True, "noprogress": True,
+                "retries": 5, "socket_timeout": 30, "continuedl": True,
+                "concurrent_fragment_downloads": 4,
+                "http_headers": headers,
+                "progress_hooks": [hook],
+            }
+            with yt_dlp.YoutubeDL(opts) as y:
+                y.download([url])
+            hits = sorted(out_dir.glob("bili_tmp_%s.*" % tag))
+            if not hits:
+                raise RuntimeError("下载失败：%s" % what)
+            return hits[0]
+
+        ffmpeg = get_ffmpeg_path()
+        tmps = []
+        try:
+            if is_mp3:
+                url = media.get("audio_url") or media.get("media_url")
+                if not url:
+                    raise RuntimeError("未找到音频流")
+                tmp = ydl_fetch(url, 0.05, 0.80, "下载音频", "a")
+                tmps.append(tmp)
+                if not ffmpeg:
+                    raise RuntimeError("需要 ffmpeg 转换 MP3，请先安装或自动下载 ffmpeg")
+                cb(0.85, "转换 MP3...")
+                out = _validated_output_file(out_dir / (title + ".mp3"), self.output_dir)
+                self._run_ffmpeg_cmd([ffmpeg, "-nostdin", "-loglevel", "error",
+                                      "-i", str(tmp), "-acodec", "libmp3lame",
+                                      "-ab", "192k", "-y", str(out)])
+            elif media["kind"] == "dash":
+                v_tmp = a_tmp = None
+                if media.get("video_url"):
+                    v_tmp = ydl_fetch(media["video_url"], 0.05, 0.60, "下载视频流", "v")
+                    tmps.append(v_tmp)
+                if media.get("audio_url"):
+                    a_tmp = ydl_fetch(media["audio_url"], 0.60, 0.80, "下载音频流", "a")
+                    tmps.append(a_tmp)
+                if v_tmp and a_tmp:
+                    if not ffmpeg:
+                        raise RuntimeError("需要 ffmpeg 合并音视频，请先安装或自动下载 ffmpeg")
+                    cb(0.85, "合并音视频...")
+                    out = _validated_output_file(out_dir / (title + ".mp4"), self.output_dir)
+                    self._run_ffmpeg_cmd([ffmpeg, "-nostdin", "-loglevel", "error", "-y",
+                                          "-i", str(v_tmp), "-i", str(a_tmp),
+                                          "-c", "copy", "-movflags", "+faststart",
+                                          str(out)])
+                else:
+                    src = v_tmp or a_tmp
+                    if not src:
+                        raise RuntimeError("未找到可下载的媒体流")
+                    out = _validated_output_file(out_dir / (title + ".mp4"), self.output_dir)
+                    os.replace(src, out)
+            else:
+                tmp = ydl_fetch(media["media_url"], 0.05, 0.85, "下载视频", "v")
+                tmps.append(tmp)
+                out = _validated_output_file(out_dir / (title + ".mp4"), self.output_dir)
+                os.replace(tmp, out)
+
+            cb(1.0, "完成!")
+            name = Path(out).name
+            item["name"] = name
+            item["status"] = "done"
+            item["progress"] = "100%"
+            self.history.add(name, "下载", True, str(out))
+            log_msg("下载成功(直连): %s" % name)
+            self.after(0, lambda n=name: self._set_status("下载成功: %s" % n))
+        finally:
+            for t in tmps:
+                try:
+                    Path(t).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
     def _do_dl_item(self, item):
         """下载单个队列项（后台线程）"""
         url = item["url"]
@@ -945,6 +1130,18 @@ class App(tk.Tk):
         ready_url = self._prepare_url(url)
         cb(0.05, "解析链接...")
         log_msg("下载: %s -> %s" % (url, ready_url))
+
+        # B站 412 风控：网页直取被拦时，改走 API 解析 + CDN 直链，失败回退 yt-dlp
+        if ("bilibili.com" in ready_url or ready_url.startswith("BV")
+                or ready_url.startswith("av")):
+            try:
+                cb(0.05, "B站直连解析...")
+                media = resolve_bilibili_media(ready_url, prefer_audio=is_mp3)
+                log_msg("B站直连解析成功: %s [%s]" % (media["title"], media.get("quality", "")))
+                return self._download_bili_direct(item, media, is_mp3, cb)
+            except Exception as e:
+                log_msg("B站直连下载失败，回退 yt-dlp 网页模式: %s" % e)
+                self._dl_pct = 0.0
 
         def progress_hook(d):
             status = d.get('status')
