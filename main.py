@@ -28,9 +28,57 @@ except ImportError:
 
 import urllib.request as _urlreq
 import urllib.parse
+import ipaddress
+import socket
+
+
+def _assert_public_http_url(url):
+    """仅允许 http/https，且主机必须解析到公网地址（防内网/本机请求）。"""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("不支持的协议: %s" % parsed.scheme)
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL 缺少主机名")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError("拒绝访问非公网地址: %s -> %s" % (host, ip))
+
+
+class _GuardedRedirectHandler(_urlreq.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_GUARDED_OPENER = None
+_GUARDED_OPENER_LOCK = threading.Lock()
+
+
+def guarded_urlopen(req, timeout):
+    """带公网校验的 urlopen，拦截重定向到内网。"""
+    global _GUARDED_OPENER
+    url = req.full_url if isinstance(req, _urlreq.Request) else req
+    _assert_public_http_url(url)
+    with _GUARDED_OPENER_LOCK:
+        if _GUARDED_OPENER is None:
+            _GUARDED_OPENER = _urlreq.build_opener(_GuardedRedirectHandler())
+    return _GUARDED_OPENER.open(req, timeout=timeout)
 
 HISTORY_FILE = Path.home() / ".transformed_history.json"
 LOG_FILE = Path.home() / ".transformed_log.txt"
+
+
+def _validated_output_file(path, base):
+    """规范化目标路径并确保其位于 base 目录内，防止路径穿越。"""
+    base = Path(base).resolve()
+    target = Path(path).resolve()
+    if target != base and base not in target.parents:
+        raise ValueError("拒绝写入 %s 之外的路径: %s" % (base, target))
+    return target
 
 # 颜色方案（深色简洁）
 BG = "#1e1e2e"
@@ -65,11 +113,11 @@ def log_msg(msg):
 def _log_trim():
     """日志超 _LOG_MAX 行时裁剪"""
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        log_file = _validated_output_file(LOG_FILE, Path.home())
+        lines = Path(log_file).read_text(encoding="utf-8").splitlines(keepends=True)
         if len(lines) > _LOG_MAX:
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.writelines(lines[-(_LOG_MAX - 100):])
+            Path(log_file).write_text(
+                "".join(lines[-(_LOG_MAX - 100):]), encoding="utf-8")
     except Exception:
         pass
 
@@ -88,8 +136,13 @@ def log_read():
 # =====================================================================
 # B站搜索（防 412 风控）
 # =====================================================================
+_BUVID_CACHE = {"buvid3": None}
+
+
 def _get_buvid3():
-    """从 B 站指纹接口获取真实 buvid3"""
+    """从 B 站指纹接口获取真实 buvid3（会话级缓存，搜索/下载共用）"""
+    if _BUVID_CACHE["buvid3"]:
+        return _BUVID_CACHE["buvid3"]
     try:
         req = _urlreq.Request(
             "https://api.bilibili.com/x/frontend/finger/spi",
@@ -98,10 +151,11 @@ def _get_buvid3():
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/120.0.0.0 Safari/537.36"),
             })
-        with _urlreq.urlopen(req, timeout=8) as r:
+        with guarded_urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8"))
         b_3 = (data.get("data") or {}).get("b_3", "")
         if b_3:
+            _BUVID_CACHE["buvid3"] = b_3
             return b_3
     except Exception as e:
         log_msg("获取 buvid3 失败: %s" % e)
@@ -132,7 +186,7 @@ def search_bilibili_songs(query, limit=6):
                 "Referer": "https://www.bilibili.com/",
                 "Cookie": cookie,
             })
-        with _urlreq.urlopen(req, timeout=8) as r:
+        with guarded_urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8"))
         if data.get("code") != 0:
             log_msg("B站搜索被拒 code=%s: %s" % (data.get("code"), data.get("message", "")))
@@ -229,8 +283,10 @@ class History:
 
     def save(self):
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.items[-500:], f, indent=2, ensure_ascii=False)
+        target = _validated_output_file(HISTORY_FILE, Path.home())
+        Path(target).write_text(
+            json.dumps(self.items[-500:], indent=2, ensure_ascii=False),
+            encoding="utf-8")
 
     def add(self, name, typ, ok, out=""):
         self.items.append({"time": datetime.now().strftime("%m-%d %H:%M"),
@@ -756,8 +812,8 @@ class App(tk.Tk):
                 if text:
                     texts.append(text)
                 cb(0.1 + (i / len(items)) * 0.8, "解析 %d/%d" % (i + 1, len(items)))
-            with open(out, "w", encoding="utf-8") as f:
-                f.write("\n\n".join(texts))
+            out = _validated_output_file(out, out_dir)
+            Path(out).write_text("\n\n".join(texts), encoding="utf-8")
             cb(1.0, "完成")
             return True, str(out)
         except Exception as e:
@@ -924,20 +980,26 @@ class App(tk.Tk):
                 "fragment_retries": 5,
                 "socket_timeout": 30,
                 "concurrent_fragment_downloads": 4,
-                "continue": True,
+                "continuedl": True,
                 "skip_unavailable_fragments": True,
                 "windowsfilenames": True,
                 "noplaylist": True,
             }
-            # B站特殊处理
+            # B站特殊处理：完整 Chrome UA + Referer + buvid3 Cookie 防 412 风控
             if ("bilibili" in ready_url or ready_url.startswith("BV")
                     or ready_url.startswith("av")):
+                headers = {
+                    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                   "Chrome/120.0.0.0 Safari/537.36"),
+                    "Referer": "https://www.bilibili.com/",
+                }
+                buvid3 = _get_buvid3()
+                if buvid3:
+                    headers["Cookie"] = "buvid3=%s" % buvid3
                 opts.update({
                     "referer": "https://www.bilibili.com/",
-                    "http_headers": {
-                        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                       "AppleWebKit/537.36")
-                    },
+                    "http_headers": headers,
                 })
             ff = get_ffmpeg_path()
             if ff:
@@ -955,6 +1017,7 @@ class App(tk.Tk):
                     }]
                 else:
                     opts["format"] = "bv*+ba/b"
+                    opts["merge_output_format"] = "mp4/mkv"
             else:
                 if is_mp3:
                     opts["format"] = "bestaudio/best"
@@ -1126,8 +1189,8 @@ class App(tk.Tk):
         self.log_text.delete(1.0, "end")
         try:
             with _LOG_LOCK:
-                with open(LOG_FILE, "w", encoding="utf-8") as f:
-                    f.truncate(0)
+                Path(_validated_output_file(LOG_FILE, Path.home())).write_text(
+                    "", encoding="utf-8")
         except Exception:
             pass
 
