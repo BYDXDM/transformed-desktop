@@ -259,3 +259,94 @@ def wait_login_qr(qrcode_key, status_cb=None, stop_event=None):
             status_cb and status_cb("等待扫码…")
         time.sleep(_POLL_INTERVAL)
     return False, None, "二维码超时，请重试"
+
+
+# ===== 直连解析（绕过网页 412 风控，与移动端同方案） =====
+
+def _extract_bvid(url):
+    m = re.search(r"(BV[0-9A-Za-z]{10})", str(url))
+    if m:
+        return m.group(1)
+    m = re.search(r"av(\d+)", str(url), re.IGNORECASE)
+    if m:
+        return "av" + m.group(1)
+    return None
+
+
+def _bili_cookie_header():
+    """API 请求用 Cookie：buvid3 + 登录凭据（如有）"""
+    parts = ["buvid3=%s" % (get_buvid3_cached() or "infoc")]
+    if BILI_COOKIES_FILE.exists():
+        try:
+            data = json.loads(BILI_COOKIES_FILE.read_text(encoding="utf-8"))
+            for k in ("SESSDATA", "bili_jct", "DedeUserID"):
+                if data.get(k):
+                    parts.append("%s=%s" % (k, data[k]))
+        except Exception:
+            pass
+    return "; ".join(parts)
+
+
+def _api_get(url):
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36"),
+        "Referer": "https://www.bilibili.com/",
+        "Cookie": _bili_cookie_header(),
+    }
+    req = _urlreq.Request(url, headers=headers)
+    with guarded_urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if data.get("code") != 0:
+        raise RuntimeError("B站接口返回 code=%s: %s" % (data.get("code"), data.get("message", "")))
+    return data.get("data") or {}
+
+
+def resolve_bilibili_media(url, prefer_audio=False):
+    """绕过网页 412：直接走 view/playurl API 解析媒体直链。
+
+    返回 dict：
+      kind="dash": video_url / audio_url（可能为空串）/ title / quality
+      kind="durl": media_url / title
+    解析失败抛 RuntimeError。
+    """
+    bvid = _extract_bvid(url)
+    if not bvid:
+        raise RuntimeError("无法从链接中识别 B站视频 ID")
+    is_bv = bvid.startswith("BV")
+    info = _api_get("https://api.bilibili.com/x/web-interface/view?%s=%s"
+                    % ("bvid" if is_bv else "aid", bvid[2:] if not is_bv else bvid))
+    title = str(info.get("title") or "bilibili")
+    cid = info.get("cid")
+    pages = info.get("pages") or []
+    if pages and pages[0].get("cid"):
+        cid = pages[0]["cid"]
+    if not cid:
+        raise RuntimeError("未获取到视频 cid")
+
+    play = _api_get("https://api.bilibili.com/x/player/playurl?%s=%s&cid=%s&qn=64&fnval=16"
+                    % ("bvid" if is_bv else "avid", bvid[2:] if not is_bv else bvid, cid))
+    dash = play.get("dash") or {}
+    durl = play.get("durl") or []
+
+    def _best(streams):
+        return max(streams, key=lambda s: (s.get("bandwidth") or 0)) if streams else None
+
+    def _u(stream):
+        return (stream or {}).get("baseUrl") or (stream or {}).get("base_url") or ""
+
+    if dash.get("video"):
+        video = _best(dash.get("video"))
+        audio = _best(dash.get("audio"))
+        if prefer_audio and audio:
+            return {"kind": "dash", "title": title, "video_url": "",
+                    "audio_url": _u(audio), "quality": "音频"}
+        return {"kind": "dash", "title": title,
+                "video_url": _u(video),
+                "audio_url": _u(audio) if audio else "",
+                "quality": "%dP" % ((video or {}).get("id") or 0) if video else ""}
+    if durl:
+        return {"kind": "durl", "title": title,
+                "media_url": durl[0].get("url", ""), "quality": "mp4"}
+    raise RuntimeError("playurl 未返回可用媒体地址")

@@ -24,3 +24,4 @@ dist/
 
 # 本地安全扫描输出
 .mimosa/
+ffmpeg/

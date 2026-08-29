@@ -11,18 +11,17 @@ REPO = "BYDXDM/transformed-desktop"
 # 发布始终从 master 切 tag；不指定的话 GitHub 会把新 tag 打在默认分支 HEAD 上
 BRANCH = "master"
 EXE = "dist/transformed.exe"
-TAG = "v1.6.0"
-NAME = "transformed Desktop v1.6.0"
-BODY = """## transformed Desktop v1.6.0
+TAG = "v1.6.1"
+NAME = "transformed Desktop v1.6.1"
+BODY = """## transformed Desktop v1.6.1
 
-### 新功能
-- ⚡ 并行下载：下载队列支持 1~3 并发（默认 2），批量下载更快，底部进度条为聚合进度
-- 🖱 拖拽导入：把文件拖进窗口自动进入对应转换卡片（EPUB/视频/图片），拖入链接自动进下载框
-- 🔑 B站扫码登录：用 B 站 APP 扫码后，B 站视频可下载更高清晰度；登录凭据仅保存在本机，一键可退出
-- 🎵 MP4 转 MP3 显示真实转换进度
-
-### v1.5.0 功能回顾
-- 设置持久化（输出目录/格式/主题）、剪贴板一键粘贴、深浅色主题切换、双击历史打开文件、静默检查更新
+### 修复：B站下载 412 风控（重要）
+- B站网页现被风控直接拦截（HTTP 412，任何客户端均无法直取网页）。
+  本次采用与移动端相同的方案：**绕过网页，直接调用官方 playurl API 解析 CDN 直链**，
+  yt-dlp 仅负责下载直链，彻底绕开 412
+- 直连失败时自动回退原 yt-dlp 网页模式，不影响其他平台
+- yt-dlp 升级至 2026.8.19
+- B站请求统一携带 buvid3 + 完整 Chrome UA；已扫码登录的用户自动携带 SESSDATA（可获取更高清晰度）
 
 ### 使用方式
 双击 transformed.exe 即可，无需 Python 环境。MP4转MP3 与部分视频合并需要 ffmpeg，程序可自动下载。
