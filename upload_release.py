@@ -11,17 +11,18 @@ REPO = "BYDXDM/transformed-desktop"
 # 发布始终从 master 切 tag；不指定的话 GitHub 会把新 tag 打在默认分支 HEAD 上
 BRANCH = "master"
 EXE = "dist/transformed.exe"
-TAG = "v1.6.1"
-NAME = "transformed Desktop v1.6.1"
-BODY = """## transformed Desktop v1.6.1
+TAG = "v1.6.2"
+NAME = "transformed Desktop v1.6.2"
+BODY = """## transformed Desktop v1.6.2
 
-### 修复：B站下载 412 风控（重要）
-- B站网页现被风控直接拦截（HTTP 412，任何客户端均无法直取网页）。
-  本次采用与移动端相同的方案：**绕过网页，直接调用官方 playurl API 解析 CDN 直链**，
-  yt-dlp 仅负责下载直链，彻底绕开 412
-- 直连失败时自动回退原 yt-dlp 网页模式，不影响其他平台
-- yt-dlp 升级至 2026.8.19
-- B站请求统一携带 buvid3 + 完整 Chrome UA；已扫码登录的用户自动携带 SESSDATA（可获取更高清晰度）
+### 交互优化
+- ▶ **点击"开始下载"直接下载**：输入框粘贴链接后一键开始，无需先点"添加到队列"
+- "添加到队列"保留：只入队不启动，适合攒一批再下载
+- 队列已有任务时，新输入的链接会自动追加一起下载
+
+### v1.6.1 修复回顾
+- B站下载 412 风控：绕过网页直取 playurl API 解析 CDN 直链，失败自动回退
+- yt-dlp 升级 2026.8.19；B站请求携带 buvid3 + 完整 Chrome UA
 
 ### 使用方式
 双击 transformed.exe 即可，无需 Python 环境。MP4转MP3 与部分视频合并需要 ffmpeg，程序可自动下载。

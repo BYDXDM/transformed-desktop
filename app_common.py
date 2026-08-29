@@ -5,7 +5,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "v1.6.1"
+APP_VERSION = "v1.6.2"
 UI_FONT = "Microsoft YaHei UI"
 
 # 深浅色主题对应的自绘控件颜色（ttk 部件由主题自动适配）。
