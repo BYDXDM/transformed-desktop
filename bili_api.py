@@ -55,6 +55,19 @@ def check_foreign_access():
     return result
 
 
+_BUVID_CACHE = {"buvid3": None}
+
+
+def get_buvid3_cached():
+    """获取真实 buvid3（会话级缓存）；失败返回 None"""
+    if _BUVID_CACHE["buvid3"]:
+        return _BUVID_CACHE["buvid3"]
+    buvid = _get_buvid3()
+    if buvid:
+        _BUVID_CACHE["buvid3"] = buvid
+    return buvid
+
+
 def _get_buvid3():
     """从 B 站指纹接口获取真实 buvid3（硬编码假值会被 412 风控拦截）"""
     try:

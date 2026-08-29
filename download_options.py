@@ -3,7 +3,9 @@
 from pathlib import Path
 import re
 
-_BILIBILI_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+_BILIBILI_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36")
 
 
 def prepare_url(value):
@@ -44,7 +46,7 @@ def is_bilibili_url(url):
 
 
 def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_hook=None,
-                           cookiefile=None):
+                           cookiefile=None, extra_headers=None):
     """Build yt-dlp options without performing network or filesystem I/O."""
     options = {
         "outtmpl": str(Path(output_dir) / "%(title)s.%(ext)s"),
@@ -65,9 +67,13 @@ def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_h
         options["progress_hooks"] = [progress_hook]
 
     if is_bilibili_url(url):
+        headers = {"User-Agent": _BILIBILI_UA}
+        # 额外请求头（如 buvid3 Cookie）仅合并进 B 站请求，防 412 风控
+        if extra_headers:
+            headers.update(extra_headers)
         options.update({
             "referer": "https://www.bilibili.com/",
-            "http_headers": {"User-Agent": _BILIBILI_UA},
+            "http_headers": headers,
             "nocheckcertificate": False,
             "format": "ba/b" if is_mp3 else "bv*+ba/b",
         })

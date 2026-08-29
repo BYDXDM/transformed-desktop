@@ -29,7 +29,7 @@ import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageTk
-from download_options import build_download_options, prepare_url
+from download_options import build_download_options, prepare_url, is_bilibili_url
 from ui_helpers import (
     UiProgressEventQueue,
     selected_history_ids,
@@ -46,6 +46,7 @@ from ffmpeg_tools import download_ffmpeg, get_ffmpeg_path, media_duration
 from bili_api import (
     check_foreign_access,
     search_bilibili_songs,
+    get_buvid3_cached,
     bili_cookies_exist,
     bili_logout,
     bili_user_id,
@@ -1224,6 +1225,13 @@ class App(ttk.Window):
                     ),
                 )
 
+        # B站下载补 buvid3 Cookie（防 412 风控）；其他平台不需要
+        bili_headers = None
+        if is_bilibili_url(ready_url):
+            buvid3 = get_buvid3_cached()
+            if buvid3:
+                bili_headers = {"Cookie": "buvid3=%s" % buvid3}
+
         try:
             opts = build_download_options(
                 ready_url,
@@ -1232,6 +1240,7 @@ class App(ttk.Window):
                 ffmpeg_path=get_ffmpeg_path(),
                 progress_hook=progress_hook,
                 cookiefile=BILI_COOKIEFILE if BILI_COOKIEFILE.exists() else None,
+                extra_headers=bili_headers,
             )
 
             cb(0.2, "下载中...")

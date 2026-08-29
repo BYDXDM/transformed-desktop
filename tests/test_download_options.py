@@ -66,6 +66,40 @@ class BilibiliDownloadOptionsTests(unittest.TestCase):
         self.assertEqual(options["referer"], "https://www.bilibili.com/")
         self.assertNotIn("postprocessors", options)
 
+    def test_bilibili_ua_is_full_chrome(self):
+        # 残缺 UA（无浏览器标识）易被 B站 412 风控拦截
+        options = build_download_options(
+            "https://www.bilibili.com/video/BV1ktMr6CEUF",
+            is_mp3=False,
+            output_dir=Path("downloads"),
+            ffmpeg_path=None,
+        )
+
+        ua = options["http_headers"]["User-Agent"]
+        self.assertIn("Chrome/120.0.0.0", ua)
+        self.assertIn("Safari/537.36", ua)
+
+    def test_extra_headers_merge_into_bilibili_only(self):
+        # buvid3 等 Cookie 只应合并进 B 站请求头
+        options = build_download_options(
+            "https://www.bilibili.com/video/BV1ktMr6CEUF",
+            is_mp3=False,
+            output_dir=Path("downloads"),
+            ffmpeg_path=None,
+            extra_headers={"Cookie": "buvid3=abc"},
+        )
+        self.assertEqual(options["http_headers"]["Cookie"], "buvid3=abc")
+
+        options = build_download_options(
+            "https://www.youtube.com/watch?v=test",
+            is_mp3=False,
+            output_dir=Path("downloads"),
+            ffmpeg_path=None,
+            extra_headers={"Cookie": "buvid3=abc"},
+        )
+        self.assertNotIn("Cookie", options.get("http_headers", {}))
+        self.assertNotIn("referer", options)
+
     def test_merges_video_download_to_mp4(self):
         # 选了 MP4 就应优先合并为 mp4，而不是 yt-dlp 默认的 mkv
         options = build_download_options(
