@@ -31,7 +31,7 @@ from PIL import Image, ImageTk
 from download_options import build_download_options, prepare_url
 from ui_helpers import UiProgressEventQueue, selected_history_ids, compute_queue_move
 
-APP_VERSION = "v1.3"
+APP_VERSION = "v1.4.4"
 UI_FONT = "Microsoft YaHei UI"
 
 # ===== 尝试导入功能库 =====
