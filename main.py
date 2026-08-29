@@ -934,12 +934,11 @@ class App(tk.Tk):
         "failed": "✗", "retrying": "↻",
     }
 
-    def _start_dl(self):
-        """将文本框中的链接添加到下载队列"""
+    def _enqueue_urls(self):
+        """把文本框中的链接加入队列。返回新增条数"""
         urls = self._get_urls_from_text()
         if not urls:
-            messagebox.showwarning("提示", "请输入至少一个视频链接")
-            return
+            return 0
         is_mp3 = self.dl_type.get() == "mp3"
         added = 0
         with self.dl_queue_lock:
@@ -951,13 +950,30 @@ class App(tk.Tk):
                 })
                 added += 1
         self.after(0, self._queue_refresh_tree)
-        self._set_status("已添加 %d 个链接到队列" % added)
         # 清空输入框
         self.url_text.delete("1.0", tk.END)
         self._set_url_placeholder(True)
-        self._start_queue_worker()
+        return added
+
+    def _start_dl(self):
+        """将文本框中的链接添加到下载队列（不自动开始）"""
+        added = self._enqueue_urls()
+        if added == 0:
+            messagebox.showwarning("提示", "请输入至少一个视频链接")
+            return
+        self._set_status("已添加 %d 个链接到队列，点击开始下载" % added)
 
     def _start_queue(self):
+        """开始下载：输入框中的链接直接入队并开始"""
+        added = self._enqueue_urls()
+        with self.dl_queue_lock:
+            has_work = any(it["status"] in ("waiting", "retrying")
+                           for it in self.dl_queue)
+        if not has_work:
+            messagebox.showwarning("提示", "没有可下载的任务：请先在输入框粘贴链接")
+            return
+        if added:
+            self._set_status("已入队 %d 个链接，开始下载" % added)
         self._start_queue_worker()
 
     def _start_queue_worker(self):
