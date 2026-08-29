@@ -4,7 +4,7 @@ import json, urllib.request, urllib.error, os, sys
 from net_guard import guarded_urlopen
 
 REPO = "BYDXDM/transformed-desktop"
-TAG = "v1.4.4"
+TAG = "v1.5.0"
 EXE = "dist/transformed.exe"
 
 def main():

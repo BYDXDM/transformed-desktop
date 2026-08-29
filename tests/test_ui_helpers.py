@@ -4,6 +4,7 @@ from ui_helpers import (
     ProgressUpdateThrottle,
     UiProgressEventQueue,
     compute_queue_move,
+    is_newer_version,
     selected_history_ids,
 )
 
@@ -51,6 +52,27 @@ class HistorySelectionTests(unittest.TestCase):
 
     def test_empty_visible_rows_returns_empty_selection(self):
         self.assertEqual(selected_history_ids(()), ())
+
+
+class IsNewerVersionTests(unittest.TestCase):
+    def test_detects_newer_version(self):
+        self.assertTrue(is_newer_version("v1.5.0", "v1.4.4"))
+        self.assertTrue(is_newer_version("v1.4.5", "v1.4.4"))
+        self.assertTrue(is_newer_version("2.0", "v1.9.9"))
+
+    def test_same_or_older_is_not_newer(self):
+        self.assertFalse(is_newer_version("v1.4.4", "v1.4.4"))
+        self.assertFalse(is_newer_version("v1.4.3", "v1.4.4"))
+        self.assertFalse(is_newer_version("v1.3", "v1.4.4"))
+
+    def test_unparsable_versions_do_not_trigger_update(self):
+        self.assertFalse(is_newer_version("", "v1.4.4"))
+        self.assertFalse(is_newer_version("unknown", "v1.4.4"))
+        self.assertFalse(is_newer_version(None, "v1.4.4"))
+
+    def test_short_versions_pad_for_comparison(self):
+        self.assertTrue(is_newer_version("v1.5", "v1.4.9"))
+        self.assertFalse(is_newer_version("v1", "v1.0.1"))
 
 
 class ComputeQueueMoveTests(unittest.TestCase):

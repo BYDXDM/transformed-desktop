@@ -1,5 +1,6 @@
 """Small UI-only helpers that can be tested without starting Tk."""
 
+import re
 from threading import Lock
 
 
@@ -39,6 +40,21 @@ class ProgressUpdateThrottle:
 def selected_history_ids(visible_ids):
     """Return all currently visible Treeview item ids for Select All."""
     return tuple(visible_ids)
+
+
+def is_newer_version(remote, current):
+    """比较形如 v1.4.4 的版本号：remote 是否比 current 更新。
+
+    只比较前 3 段数字；任一版本无法解析时返回 False（不误报更新）。
+    """
+    def parts(v):
+        nums = [int(m) for m in re.findall(r"\d+", str(v))[:3]]
+        return tuple(nums + [0] * (3 - len(nums))) if nums else None
+
+    rp, cp = parts(remote), parts(current)
+    if not rp or not cp:
+        return False
+    return rp > cp
 
 
 def compute_queue_move(n, selected, direction, blocked=()):

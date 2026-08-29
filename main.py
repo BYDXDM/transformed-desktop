@@ -18,6 +18,7 @@ from tkinter import filedialog, messagebox, scrolledtext
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import threading
+import time
 import os
 import json
 import re
@@ -29,10 +30,35 @@ from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageTk
 from download_options import build_download_options, prepare_url
-from ui_helpers import UiProgressEventQueue, selected_history_ids, compute_queue_move
+from ui_helpers import (
+    UiProgressEventQueue,
+    selected_history_ids,
+    compute_queue_move,
+    is_newer_version,
+)
+from net_guard import guarded_urlopen
 
-APP_VERSION = "v1.4.4"
+APP_VERSION = "v1.5.0"
 UI_FONT = "Microsoft YaHei UI"
+
+# 深浅色主题对应的自绘控件颜色（ttk 部件由主题自动适配）。
+# btn = 切换按钮的文字（描述点击后将切到的目标主题）
+THEMES = {
+    "superhero": {
+        "btn": "🌙 深色",
+        "bg": "#1a1a2e", "fg": "#e0e0e0", "ph": "#667788",
+        "zebra_odd": "#223140", "zebra_even": "#2b3e50",
+        "q_tags": {"waiting": "#8899aa", "downloading": "#00ccff",
+                   "done": "#44cc44", "failed": "#ff5555", "retrying": "#ffaa00"},
+    },
+    "flatly": {
+        "btn": "☀ 浅色",
+        "bg": "#ffffff", "fg": "#212529", "ph": "#95a5a6",
+        "zebra_odd": "#eef2f5", "zebra_even": "#ffffff",
+        "q_tags": {"waiting": "#6c7a89", "downloading": "#0b76b8",
+                   "done": "#1e9e33", "failed": "#d32f2f", "retrying": "#d48806"},
+    },
+}
 
 # ===== 尝试导入功能库 =====
 try:
@@ -50,6 +76,49 @@ except ImportError:
 # ===== 配置 =====
 HISTORY_FILE = Path.home() / ".transformed_history.json"
 LOG_FILE = Path.home() / ".transformed_log.txt"
+SETTINGS_FILE = (Path.home() / ".transformed_settings.json").resolve()
+
+
+class AppSettings:
+    """轻量设置持久化（输出目录/下载格式/主题等），损坏时回退默认值。"""
+    DEFAULTS = {
+        "output_dir": "",
+        "dl_type": "mp4",
+        "theme": "superhero",
+        "update_last_check": 0.0,
+    }
+    _lock = threading.Lock()
+
+    def __init__(self, path=SETTINGS_FILE):
+        self.path = Path(path)
+        self.data = dict(self.DEFAULTS)
+        self.load()
+
+    def load(self):
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    self.data.update({k: raw[k] for k in self.DEFAULTS if k in raw})
+        except Exception:
+            pass
+
+    def save(self):
+        with self._lock:
+            try:
+                target = _validated_output_file(self.path, Path.home())
+                Path(target).write_text(
+                    json.dumps(self.data, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
+            except Exception:
+                pass
+
+    def get(self, key):
+        return self.data.get(key, self.DEFAULTS.get(key))
+
+    def set(self, key, value):
+        self.data[key] = value
+        self.save()
 
 
 def _validated_output_file(path, base):
@@ -431,7 +500,11 @@ def get_asset(name):
 
 class App(ttk.Window):
     def __init__(self):
-        super().__init__(title=f"transformed 桌面版 {APP_VERSION}", themename="superhero")
+        self.settings = AppSettings()
+        theme = self.settings.get("theme")
+        self._theme = theme if theme in THEMES else "superhero"
+        super().__init__(title=f"transformed 桌面版 {APP_VERSION}",
+                         themename=self._theme)
 
         self.geometry("1280x800")
         self.minsize(1050, 650)
@@ -442,6 +515,10 @@ class App(ttk.Window):
         exe_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
         self.output_dir = str(exe_dir / "transformed_output")
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        # 上次设置的输出目录仍然存在时优先使用
+        saved_dir = self.settings.get("output_dir")
+        if saved_dir and Path(saved_dir).is_dir():
+            self.output_dir = saved_dir
 
         # ===== 下载队列 =====
         self.dl_queue = []           # [{url, is_mp3, status, name, error}, ...]
@@ -462,9 +539,12 @@ class App(ttk.Window):
         self._set_window_icon()
 
         self._build_ui()
+        self._apply_theme_colors()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._ui_drain_after_id = self.after(50, self._drain_progress_events)
         self._check_deps()
+        # 延迟几秒再静默检查更新，不影响启动速度
+        self.after(2500, self._check_update_async)
 
     def _set_window_icon(self):
         """用看板娘立绘生成窗口图标"""
@@ -585,6 +665,10 @@ class App(ttk.Window):
         ttk.Button(header, text="⟳", width=3,
                   command=lambda: self.history_tree_refresh(),
                   bootstyle="outline").pack(side=RIGHT, padx=2)
+        self.theme_btn = ttk.Button(header, text=THEMES["flatly" if self._theme == "superhero" else "superhero"]["btn"],
+                                    command=self._toggle_theme,
+                                    bootstyle="outline")
+        self.theme_btn.pack(side=RIGHT, padx=2)
 
         ttk.Separator(self).pack(fill=X, padx=14)
 
@@ -699,11 +783,16 @@ class App(ttk.Window):
         btn_row = ttk.Frame(url_box)
         btn_row.pack(fill=X, pady=(0, 2))
 
-        self.dl_type = tk.StringVar(value="mp4")
+        saved_type = self.settings.get("dl_type")
+        self.dl_type = tk.StringVar(value=saved_type if saved_type in ("mp4", "mp3") else "mp4")
+        # 任何方式改变格式都持久化（点击/键盘/程序赋值）
+        self.dl_type.trace_add("write", lambda *_: self.settings.set("dl_type", self.dl_type.get()))
         ttk.Radiobutton(btn_row, text="🎬 MP4", variable=self.dl_type,
                        value="mp4", bootstyle="success").pack(side=LEFT, padx=2)
         ttk.Radiobutton(btn_row, text="🎵 MP3", variable=self.dl_type,
                        value="mp3", bootstyle="warning").pack(side=LEFT, padx=2)
+        ttk.Button(btn_row, text="📋 粘贴", bootstyle="outline",
+                  command=self._paste_from_clipboard).pack(side=LEFT, padx=(0, 8))
 
         ttk.Button(btn_row, text="➕ 添加到队列", bootstyle="info",
                   command=self._start_dl).pack(side=RIGHT, padx=3)
@@ -882,6 +971,7 @@ class App(ttk.Window):
         self.tree.bind("<Control-a>", self._history_select_all_visible)
         self.tree.bind("<Control-A>", self._history_select_all_visible)
         self.tree.bind("<Delete>", lambda event: self._history_delete_selected())
+        self.tree.bind("<Double-1>", self._on_history_double_click)
         
         # 底部按钮
         btm = ttk.Frame(parent)
@@ -901,7 +991,82 @@ class App(ttk.Window):
         if d:
             self.output_dir = d
             Path(d).mkdir(parents=True, exist_ok=True)
-            self.status.config(text=f"输出目录: {d}")
+            self.settings.set("output_dir", d)
+            self.status.config(text=f"输出目录: {d}（已记住）")
+
+    # ---- 主题 ----
+    def _theme_colors(self):
+        return THEMES.get(self._theme, THEMES["superhero"])
+
+    def _apply_theme_colors(self):
+        """主题切换后同步自绘控件（文本框/斑马纹/队列状态色/按钮文字）的颜色"""
+        c = self._theme_colors()
+        for widget in (self.url_text, self.log_text):
+            widget.config(bg=c["bg"], fg=c["fg"], insertbackground=c["fg"])
+        self.tree.tag_configure("odd", background=c["zebra_odd"])
+        self.tree.tag_configure("even", background=c["zebra_even"])
+        for tag, color in c["q_tags"].items():
+            self.queue_tree.tag_configure(tag, foreground=color)
+        if getattr(self, "_url_placeholder_active", False):
+            self.url_text.config(fg=c["ph"])
+        other = "flatly" if self._theme == "superhero" else "superhero"
+        self.theme_btn.config(text=THEMES[other]["btn"])
+
+    def _toggle_theme(self):
+        new = "flatly" if self._theme == "superhero" else "superhero"
+        try:
+            self.style.theme_use(new)
+        except Exception as e:
+            Logger.log(f"切换主题失败: {e}")
+            return
+        self._theme = new
+        self.settings.set("theme", new)
+        self._apply_theme_colors()
+        self.status.config(text=f"主题已切换: {new}")
+
+    # ---- 剪贴板 ----
+    def _paste_from_clipboard(self):
+        """把剪贴板内容追加到链接输入框"""
+        try:
+            text = self.clipboard_get().strip()
+        except tk.TclError:
+            text = ""
+        if not text:
+            self.show_toast("提示", "剪贴板是空的", "warning")
+            return
+        if self._url_placeholder_active:
+            self._on_url_text_focus_in()
+        self.url_text.insert(tk.END, text + "\n")
+        self.url_text.see(tk.END)
+        self.status.config(text="已从剪贴板粘贴链接")
+
+    # ---- 更新检查 ----
+    def _check_update_async(self):
+        """每 24 小时静默检查一次 GitHub 最新 Release，有新版时在状态栏提示"""
+        try:
+            last = float(self.settings.get("update_last_check") or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if time.time() - last < 24 * 3600:
+            return
+
+        def run():
+            try:
+                req = _urlreq.Request(
+                    "https://api.github.com/repos/BYDXDM/transformed-desktop/releases/latest",
+                    headers={"User-Agent": f"transformed/{APP_VERSION}"})
+                with guarded_urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                tag = str(data.get("tag_name") or "")
+                if is_newer_version(tag, APP_VERSION):
+                    self._run_on_ui("update-hint", lambda t=tag: self.status.config(
+                        text=f"🆕 发现新版本 {t}，可到 GitHub Releases 页面下载"))
+            except Exception:
+                pass
+            finally:
+                self.settings.set("update_last_check", time.time())
+
+        threading.Thread(target=run, daemon=True).start()
     
     def _pick(self, key, filetypes):
         ct = self.convert_cards[key]
@@ -1029,23 +1194,60 @@ class App(ttk.Window):
         except Exception as e:
             return False, str(e)
     
+    @staticmethod
+    def _media_duration(ffmpeg, path, no_window):
+        """用 ffprobe 读取媒体时长（秒），失败返回 None"""
+        ffprobe = Path(ffmpeg).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe")
+        if not ffprobe.exists():
+            return None
+        try:
+            proc = subprocess.run(
+                [str(ffprobe), "-v", "error", "-show_entries", "format=duration",
+                 "-of", "default=nw=1:nk=1", str(path)],
+                capture_output=True, shell=False, timeout=30,
+                creationflags=no_window)
+            return float(proc.stdout.decode("ascii", "replace").strip())
+        except Exception:
+            return None
+
     def _conv_mp4(self, path, out_dir, cb):
         ffmpeg = get_ffmpeg_path()
         if not ffmpeg:
             return False, "未找到 ffmpeg，请重新启动程序并选择自动下载"
+        # GUI(pythonw) 模式下防止 ffmpeg 弹出黑色控制台窗口
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         try:
-            cb(0.2, "提取音频...")
+            cb(0.05, "读取时长...")
+            duration = self._media_duration(ffmpeg, path, no_window)
             name = Path(path).stem
-            out = Path(out_dir) / f"{name}.mp3"
-            cmd = [ffmpeg, "-i", str(path), "-vn",
+            out = _validated_output_file(Path(out_dir) / f"{name}.mp3", out_dir)
+            cmd = [ffmpeg, "-nostdin", "-loglevel", "error",
+                   "-i", str(path), "-vn",
                    "-acodec", "libmp3lame", "-ab", "192k",
                    "-y", str(out)]
-            # GUI(pythonw) 模式下防止 ffmpeg 弹出黑色控制台窗口
-            no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-            proc = subprocess.run(cmd, capture_output=True, shell=False,
-                                  creationflags=no_window)
+            if duration:
+                cmd += ["-progress", "pipe:1"]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, shell=False,
+                                    creationflags=no_window)
+            try:
+                for line in proc.stdout:
+                    text = line.decode("ascii", "replace").strip()
+                    # out_time_ms 单位是微秒；按已转换时长映射到 5%~95%
+                    if duration and text.startswith("out_time_ms="):
+                        try:
+                            ratio = max(0.0, min(float(text.split("=", 1)[1]) / 1e6 / duration, 1.0))
+                            cb(0.05 + ratio * 0.9, f"转换中 {ratio * 100:.0f}%")
+                        except ValueError:
+                            pass
+                proc.wait()
+            finally:
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.stderr:
+                    proc.stderr.close()
             if proc.returncode != 0:
-                err = (proc.stderr or b"").decode("utf-8", errors="replace")[-300:]
+                err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-300:]
                 return False, f"ffmpeg 转换失败(code={proc.returncode}): {err}"
             if not Path(out).exists() or Path(out).stat().st_size == 0:
                 return False, "ffmpeg 未生成输出文件"
@@ -1129,7 +1331,7 @@ class App(ttk.Window):
         """文本框获得焦点时，若为占位符则清空"""
         if self._url_placeholder_active:
             self.url_text.delete("1.0", tk.END)
-            self.url_text.config(fg="#e0e0e0")
+            self.url_text.config(fg=self._theme_colors()["fg"])
             self._url_placeholder_active = False
 
     def _on_url_text_focus_out(self, event=None):
@@ -1144,7 +1346,7 @@ class App(ttk.Window):
             if not content or content == self._url_placeholder.strip():
                 self.url_text.delete("1.0", tk.END)
                 self.url_text.insert("1.0", self._url_placeholder)
-                self.url_text.config(fg="#667788")
+                self.url_text.config(fg=self._theme_colors()["ph"])
                 self._url_placeholder_active = True
             else:
                 self._url_placeholder_active = False
@@ -1660,6 +1862,32 @@ class App(ttk.Window):
                              values=(h.get("time", ""), str(h.get("name", ""))[:25], typ, s))
             row += 1
     
+    def _on_history_double_click(self, event):
+        """双击历史记录：打开对应的输出文件"""
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        try:
+            idx = int(iid)
+        except ValueError:
+            return
+        with History._lock:
+            if not (0 <= idx < len(self.history.items)):
+                return
+            item = dict(self.history.items[idx])
+        out = str(item.get("out") or "")
+        if not out or out.startswith("skipped:"):
+            self.show_toast("提示", "该记录没有关联的输出文件", "info")
+            return
+        p = Path(out)
+        if p.exists():
+            try:
+                os.startfile(p)
+            except Exception:
+                pass
+        else:
+            self.show_toast("提示", f"文件不存在（可能已被移动或删除）:\n{p.name}", "warning")
+
     def _history_delete_selected(self):
         """删除勾选的记录（支持多选）"""
         sel = self.tree.selection()
