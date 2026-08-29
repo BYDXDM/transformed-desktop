@@ -39,3 +39,39 @@ class ProgressUpdateThrottle:
 def selected_history_ids(visible_ids):
     """Return all currently visible Treeview item ids for Select All."""
     return tuple(visible_ids)
+
+
+def compute_queue_move(n, selected, direction, blocked=()):
+    """Compute a one-step queue move for a multi-selection.
+
+    n:        total number of items.
+    selected: indexes of items to move (each moves exactly one step).
+    direction: -1 to move up, +1 to move down.
+    blocked:  indexes that must not move and must not be crossed
+              (e.g. the item currently downloading).
+
+    Returns the new order as a list where order[position] = original index.
+    Selected items keep their relative order; moves that would collide with
+    another selected item, a blocked item, or the list edge are skipped.
+    """
+    order = list(range(n))
+    pos = {item: p for p, item in enumerate(order)}
+    sel = {i for i in selected if 0 <= i < n}
+    # blocked 保持绝对语义：正在下载的项自己不动，别人也不能越过它
+    blocked = {i for i in blocked if 0 <= i < n}
+
+    # 向下时从最底下开始处理，向上时从最顶上开始处理，
+    # 这样先处理的项目腾出的空位不会影响未处理项目的判断
+    for item in sorted(sel, reverse=(direction > 0)):
+        if item in blocked:
+            continue
+        p = pos[item]
+        q = p + direction
+        if not (0 <= q < n):
+            continue
+        other = order[q]
+        if other in sel or other in blocked:
+            continue
+        order[p], order[q] = other, item
+        pos[item], pos[other] = q, p
+    return order

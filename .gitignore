@@ -21,3 +21,6 @@ dist/
 .idea/
 .vscode/
 *.swp
+
+# 本地安全扫描输出
+.mimosa/

@@ -1,6 +1,8 @@
 """上传 exe 到已存在的 Release"""
 import json, urllib.request, urllib.error, os, sys
 
+from net_guard import guarded_urlopen
+
 REPO = "BYDXDM/transformed-desktop"
 TAG = "v1.3.0"
 EXE = "dist/transformed.exe"
@@ -18,7 +20,7 @@ def main():
         headers=headers, method="GET"
     )
     try:
-        with urllib.request.urlopen(req) as r:
+        with guarded_urlopen(req) as r:
             release = json.loads(r.read())
             upload_url = release["upload_url"].split("{")[0]
             print(f"Release found: {release['html_url']}")
@@ -34,7 +36,7 @@ def main():
                 f"https://api.github.com/repos/{REPO}/releases/assets/{asset['id']}",
                 headers=headers, method="DELETE"
             )
-            urllib.request.urlopen(del_req)
+            guarded_urlopen(del_req)
 
     exe_path = os.path.join(os.path.dirname(__file__), EXE)
     if not os.path.exists(exe_path):
@@ -52,7 +54,7 @@ def main():
             method="POST"
         )
         try:
-            with urllib.request.urlopen(upload_req, timeout=300) as r:
+            with guarded_urlopen(upload_req, timeout=300) as r:
                 asset = json.loads(r.read())
                 print(f"UPLOAD OK: {asset['browser_download_url']}")
         except urllib.error.HTTPError as e:

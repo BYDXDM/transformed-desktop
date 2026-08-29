@@ -16,17 +16,20 @@ def prepare_url(value):
     if url_match:
         return url_match.group(1).rstrip('，。！？、,.;!?')
 
-    bvid_match = re.search(r'(BV[0-9A-Za-z]{10})', value)
+    # BV 号：前后不能紧贴字母数字，避免误匹配长文本片段
+    bvid_match = re.search(r'(?<![0-9A-Za-z])(BV[0-9A-Za-z]{10})(?![0-9A-Za-z])', value)
     if bvid_match:
         return f"https://www.bilibili.com/video/{bvid_match.group(1)}"
 
-    avid_match = re.search(r'(av\d+)', value, re.IGNORECASE)
-    if avid_match:
-        return f"https://www.bilibili.com/video/{avid_match.group(1)}"
-
-    b23_match = re.match(r'(b23\.tv/[0-9A-Za-z]+)', value, re.IGNORECASE)
+    # b23 短链可能出现在句子中间，用 search 而不是 match
+    b23_match = re.search(r'(b23\.tv/[0-9A-Za-z]+)', value, re.IGNORECASE)
     if b23_match:
         return f"https://{b23_match.group(1)}"
+
+    # AV 号：同样加词边界，避免 "brav123" 之类误伤
+    avid_match = re.search(r'(?<![0-9A-Za-z])av(\d+)(?![0-9A-Za-z])', value, re.IGNORECASE)
+    if avid_match:
+        return f"https://www.bilibili.com/video/av{avid_match.group(1)}"
 
     if "." in value and re.search(r'\.[a-zA-Z]{2,}(/|$)', value):
         return "https://" + value
@@ -36,7 +39,8 @@ def prepare_url(value):
 def is_bilibili_url(url):
     """Return whether a normalized URL is served by Bilibili."""
     lower_url = url.lower()
-    return "bilibili.com" in lower_url or lower_url.startswith("bv") or lower_url.startswith("av")
+    return ("bilibili.com" in lower_url or "b23.tv" in lower_url
+            or lower_url.startswith("bv") or lower_url.startswith("av"))
 
 
 def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_hook=None):
@@ -50,9 +54,9 @@ def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_h
         "fragment_retries": 5,
         "socket_timeout": 30,
         "concurrent_fragment_downloads": 4,
-        "continue": True,
+        # yt-dlp 的断点续传参数名是 continuedl（"continue" 会被静默忽略）
+        "continuedl": True,
         "skip_unavailable_fragments": True,
-        "fragment_retries_base": 2,
         "windowsfilenames": True,
         "noplaylist": True,
     }
@@ -70,6 +74,11 @@ def build_download_options(url, is_mp3, output_dir, ffmpeg_path=None, progress_h
         options["format"] = "bestaudio/best"
     else:
         options["format"] = "bv*+ba/best"
+
+    if not is_mp3:
+        # 优先合并为 mp4（B站等 h264+aac 源），流不兼容时回退 mkv，
+        # 避免 yt-dlp 默认把选了 MP4 的下载合并成 .mkv
+        options["merge_output_format"] = "mp4/mkv"
 
     if ffmpeg_path:
         options["ffmpeg_location"] = str(Path(ffmpeg_path).parent)

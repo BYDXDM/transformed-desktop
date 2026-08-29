@@ -5,6 +5,8 @@ import urllib.error
 import sys
 import os
 
+from net_guard import guarded_urlopen
+
 REPO = "BYDXDM/transformed-desktop"
 EXE = "dist/transformed.exe"
 TAG = "v1.3.0"
@@ -52,7 +54,7 @@ def main():
         data=data, headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(req) as r:
+        with guarded_urlopen(req) as r:
             release = json.loads(r.read())
             upload_url = release["upload_url"].split("{")[0]
             print(f"Release created: {release['html_url']}")
@@ -80,7 +82,7 @@ def main():
             method="POST"
         )
         try:
-            with urllib.request.urlopen(upload_req) as r:
+            with guarded_urlopen(upload_req, timeout=300) as r:
                 asset = json.loads(r.read())
                 print(f"Upload OK: {asset['browser_download_url']}")
         except urllib.error.HTTPError as e:

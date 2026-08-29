@@ -6,17 +6,12 @@ transformed 桌面版 - 现代化 UI
 """
 
 import sys
-import io
 # 强制使用 UTF-8，解决 Windows 控制台乱码
 if sys.stdout and hasattr(sys.stdout, 'encoding'):
     try:
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:
         pass
-try:
-    io.sys = sys
-except Exception:
-    pass
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
@@ -24,18 +19,20 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import threading
 import os
-import sys
 import json
 import re
 import shutil
 import subprocess
+import urllib.request as _urlreq
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageTk
-import base64
-import io
 from download_options import build_download_options, prepare_url
-from ui_helpers import UiProgressEventQueue, selected_history_ids
+from ui_helpers import UiProgressEventQueue, selected_history_ids, compute_queue_move
+
+APP_VERSION = "v1.3"
+UI_FONT = "Microsoft YaHei UI"
 
 # ===== 尝试导入功能库 =====
 try:
@@ -54,7 +51,74 @@ except ImportError:
 HISTORY_FILE = Path.home() / ".transformed_history.json"
 LOG_FILE = Path.home() / ".transformed_log.txt"
 
+
+def _validated_output_file(path, base):
+    """规范化目标路径并确保其位于 base 目录内，防止路径穿越。"""
+    base = Path(base).resolve()
+    target = Path(path).resolve()
+    if target != base and base not in target.parents:
+        raise ValueError(f"拒绝写入 {base} 之外的路径: {target}")
+    return target
+
 # ===== ffmpeg 管理 =====
+import ipaddress
+import socket
+
+
+def _assert_public_http_url(url):
+    """仅允许 http/https，且主机必须解析到公网地址。
+
+    阻断环回、私有、链路本地、保留、组播地址，防止请求被导向内网或本机服务。
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"不支持的协议: {parsed.scheme}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL 缺少主机名")
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM):
+        ip = ipaddress.ip_address(info[4][0])
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            raise ValueError(f"拒绝访问非公网地址: {host} -> {ip}")
+
+
+class _GuardedRedirectHandler(_urlreq.HTTPRedirectHandler):
+    """重定向目标同样经过公网校验，防止 30x 跳转到内网。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _assert_public_http_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_GUARDED_OPENER = None
+_GUARDED_OPENER_LOCK = threading.Lock()
+
+
+def guarded_urlopen(req, timeout):
+    """带 SSRF 防护的 urlopen：校验协议/主机/解析后的 IP，并拦截危险重定向。"""
+    global _GUARDED_OPENER
+    url = req.full_url if isinstance(req, _urlreq.Request) else req
+    _assert_public_http_url(url)
+    with _GUARDED_OPENER_LOCK:
+        if _GUARDED_OPENER is None:
+            _GUARDED_OPENER = _urlreq.build_opener(_GuardedRedirectHandler())
+    return _GUARDED_OPENER.open(req, timeout=timeout)
+
+
+def safe_extractall(zf, dest):
+    """防 Zip Slip：拒绝绝对路径或包含 .. 的压缩条目再解压。"""
+    dest = Path(dest).resolve()
+    for member in zf.infolist():
+        target = (dest / member.filename).resolve()
+        try:
+            target.relative_to(dest)
+        except ValueError:
+            raise ValueError(f"压缩包内含非法路径，已拒绝解压: {member.filename}")
+    zf.extractall(dest)
+
+
 def get_ffmpeg_dir():
     """ffmpeg 安装目录：优先 exe 同目录，其次用户目录"""
     # exe 打包后 __file__ 是临时解压目录，用 sys.executable 的目录
@@ -81,27 +145,40 @@ def download_ffmpeg(progress_cb=None):
     """自动下载 ffmpeg for Windows"""
     if os.name != "nt":
         return False, "ffmpeg 自动下载仅支持 Windows，请手动安装"
-    
+
     url = ("https://github.com/BtbN/FFmpeg-Builds/releases/download/"
            "latest/ffmpeg-master-latest-win64-gpl-shared.zip")
-    
+
     dest = get_ffmpeg_dir()
     dest.mkdir(parents=True, exist_ok=True)
-    zip_path = dest / "ffmpeg.zip"
-    
+    zip_path = _validated_output_file(dest / "ffmpeg.zip", dest)
+    extract_dir = dest / "_extract"
+
     try:
         progress_cb and progress_cb("正在下载 ffmpeg (约30MB)...")
-        import urllib.request
-        urllib.request.urlretrieve(url, zip_path)
-        
+        # 带超时+进度+公网校验的流式下载，替代无超时、易永久卡死的 urlretrieve
+        req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        buf = bytearray()
+        with guarded_urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length") or 0)
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if total:
+                    progress_cb and progress_cb(
+                        f"正在下载 ffmpeg... {len(buf) / 1048576:.1f}/{total / 1048576:.1f} MB")
+        zip_path = _validated_output_file(dest / "ffmpeg.zip", dest)
+        Path(zip_path).write_bytes(bytes(buf))
+
         progress_cb and progress_cb("正在解压...")
         import zipfile
         with zipfile.ZipFile(zip_path) as z:
-            # 解压到临时，然后移动 bin/ 内容
-            extract_dir = dest / "_extract"
+            # 解压到临时目录（防 Zip Slip），再移动 bin/ 内容
             extract_dir.mkdir(exist_ok=True)
-            z.extractall(extract_dir)
-        
+            safe_extractall(z, extract_dir)
+
         # 找到 bin 目录（解压出来可能是 ffmpeg-master-latest-win64-gpl-shared/）
         bin_dir = None
         for d in extract_dir.iterdir():
@@ -109,53 +186,73 @@ def download_ffmpeg(progress_cb=None):
             if b.exists():
                 bin_dir = b
                 break
-        
-        if bin_dir:
-            # 移动 ffmpeg.exe 到我们的 ffmpeg/bin/
-            target = dest / "bin"
-            target.mkdir(exist_ok=True)
-            for f in bin_dir.iterdir():
-                shutil.copy2(f, target / f.name)
-        
-        # 清理
-        shutil.rmtree(extract_dir, ignore_errors=True)
-        zip_path.unlink(missing_ok=True)
-        
+
+        if not bin_dir:
+            return False, "ffmpeg 压缩包结构异常，未找到 bin 目录"
+
+        # 移动 ffmpeg.exe 到我们的 ffmpeg/bin/
+        target = dest / "bin"
+        target.mkdir(exist_ok=True)
+        for f in bin_dir.iterdir():
+            shutil.copy2(f, target / f.name)
+
+        if not get_ffmpeg_path():
+            return False, "ffmpeg 解压完成但未找到可执行文件"
+
         return True, str(get_ffmpeg_path())
     except Exception as e:
         return False, f"ffmpeg 下载失败: {e}"
+    finally:
+        # 无论成败都清理临时文件（半截 zip / 解压目录）
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        try:
+            zip_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 # ===== 工具类 =====
 import urllib.request as _urlreq
 import urllib.parse
+
+_FOREIGN_CACHE = {"ts": 0.0, "ok": False, "reason": ""}
+_FOREIGN_CACHE_TTL = 600  # 检测结果缓存 10 分钟，避免每个外网任务都等 5 秒探测
+
 
 def check_foreign_access():
     """检测当前网络能否访问外网(YouTube等)。返回 (bool, 信息)
     - 能访问外网: (True, 描述)
     - 不能(需代理): (False, 原因描述)
     """
+    import time
+    now = time.time()
+    if now - _FOREIGN_CACHE["ts"] < _FOREIGN_CACHE_TTL:
+        return _FOREIGN_CACHE["ok"], _FOREIGN_CACHE["reason"]
+
+    result = None
     # 通过 ipinfo 获取出口 IP 归属地
     try:
-        req = _urlreq.Request("https://ipinfo.io/json", 
+        req = _urlreq.Request("https://ipinfo.io/json",
                              headers={"User-Agent": "Mozilla/5.0"})
-        with _urlreq.urlopen(req, timeout=5) as r:
-            import json as _j
-            data = _j.loads(r.read().decode())
+        with guarded_urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode())
             country = data.get("country", "")
             ip = data.get("ip", "?")
-            org = data.get("org", "")
             if country == "CN":
-                return False, f"当前 IP({ip})归属中国，直连外网受限，下载 YouTube/X 需代理"
-            return True, f"当前 IP({ip}) 非中国归属，可访问外网"
-    except Exception as e:
-        # ipinfo 都连不上，尝试直接测 google 连通性
+                result = (False, f"当前 IP({ip})归属中国，直连外网受限，下载 YouTube/X 需代理")
+            else:
+                result = (True, f"当前 IP({ip}) 非中国归属，可访问外网")
+    except Exception:
+        # ipinfo 都连不上，尝试直接测 youtube 连通性
         try:
-            req = _urlreq.Request("https://www.youtube.com", 
+            req = _urlreq.Request("https://www.youtube.com",
                                  headers={"User-Agent": "Mozilla/5.0"})
-            with _urlreq.urlopen(req, timeout=5) as r:
-                return True, "可访问外网(YouTube可达)"
+            with guarded_urlopen(req, timeout=5) as r:
+                result = (True, "可访问外网(YouTube可达)")
         except Exception:
-            return False, "无法访问外网(YouTube不可达)，可能需要代理"
+            result = (False, "无法访问外网(YouTube不可达)，可能需要代理")
+
+    _FOREIGN_CACHE.update({"ts": now, "ok": result[0], "reason": result[1]})
+    return result
 
 
 def _get_buvid3():
@@ -166,7 +263,7 @@ def _get_buvid3():
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             })
-        with _urlreq.urlopen(req, timeout=8) as r:
+        with guarded_urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8"))
         b_3 = (data.get("data") or {}).get("b_3", "")
         if b_3:
@@ -198,7 +295,7 @@ def search_bilibili_songs(query, limit=6):
                 "Referer": "https://www.bilibili.com/",
                 "Cookie": cookie,
             })
-        with _urlreq.urlopen(req, timeout=8) as r:
+        with guarded_urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8"))
         if data.get("code") != 0:
             Logger.log(f"B站搜索被拒 code={data.get('code')}: {data.get('message','')}")
@@ -256,11 +353,11 @@ class Logger:
         """日志超 _LOG_MAX 行时裁剪到 _LOG_MAX-100 行，避免无限增长。
         加锁保护，避免多线程并发裁剪互相覆盖。"""
         try:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                lines = f.readlines()
+            log_file = _validated_output_file(LOG_FILE, Path.home())
+            lines = Path(log_file).read_text(encoding="utf-8").splitlines(keepends=True)
             if len(lines) > _LOG_MAX:
-                with open(LOG_FILE, "w", encoding="utf-8") as f:
-                    f.writelines(lines[-(_LOG_MAX - 100):])
+                Path(log_file).write_text(
+                    "".join(lines[-(_LOG_MAX - 100):]), encoding="utf-8")
         except:
             pass
     
@@ -275,6 +372,10 @@ class Logger:
         return []
 
 class History:
+    # 工作线程(add)与 UI 线程(删除/清空)都会写入，用 RLock 防止并发写坏 JSON。
+    # 所有写入统一经由 add/delete/clear 持锁后调用 save()（RLock 可重入）。
+    _lock = threading.RLock()
+
     def __init__(self):
         self.items = []
         self.load()
@@ -289,20 +390,35 @@ class History:
     
     def save(self):
         HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.items[-500:], f, indent=2, ensure_ascii=False)
+        target = _validated_output_file(HISTORY_FILE, Path.home())
+        Path(target).write_text(
+            json.dumps(self.items[-500:], indent=2, ensure_ascii=False),
+            encoding="utf-8")
     
     def add(self, name, typ, ok, out=""):
-        self.items.append({
-            "time": datetime.now().strftime("%m-%d %H:%M"),
-            "name": name, "type": typ,
-            "ok": ok, "out": out
-        })
-        self.save()
-    
+        with self._lock:
+            self.items.append({
+                "time": datetime.now().strftime("%m-%d %H:%M"),
+                "name": name, "type": typ,
+                "ok": ok, "out": out
+            })
+            self.save()
+
+    def delete(self, indexes):
+        """按原始索引批量删除记录（倒序删除避免索引位移），返回实际删除数"""
+        removed = 0
+        with self._lock:
+            for idx in sorted(indexes, reverse=True):
+                if 0 <= idx < len(self.items):
+                    del self.items[idx]
+                    removed += 1
+            self.save()
+        return removed
+
     def clear(self):
-        self.items = []
-        self.save()
+        with self._lock:
+            self.items = []
+            self.save()
 
 
 # ===== 主应用 =====
@@ -315,11 +431,11 @@ def get_asset(name):
 
 class App(ttk.Window):
     def __init__(self):
-        super().__init__(title="transformed", themename="superhero")
-        
+        super().__init__(title=f"transformed 桌面版 {APP_VERSION}", themename="superhero")
+
         self.geometry("1280x800")
         self.minsize(1050, 650)
-        
+
         self.history = History()
         self.task_running = False
         self.convert_cards = {}
@@ -337,17 +453,30 @@ class App(ttk.Window):
         self._url_placeholder_active = True
         self._dl_pct = 0.0
         self._progress_events = UiProgressEventQueue()
-        
+
         # 两侧看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
         # 目标高度 = 窗口高(800) - header(55) - status(35) - padding(30) ≈ 680
         self._whale_h = 680
         self.img_left = self._load_whale("whale_left.webp", 235, self._whale_h)
         self.img_right = self._load_whale("whale_right.webp", 235, self._whale_h)
-        
+        self._set_window_icon()
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._ui_drain_after_id = self.after(50, self._drain_progress_events)
         self._check_deps()
+
+    def _set_window_icon(self):
+        """用看板娘立绘生成窗口图标"""
+        try:
+            p = get_asset("whale_left.webp")
+            if p:
+                img = Image.open(p).convert("RGBA")
+                img.thumbnail((64, 64), Image.LANCZOS)
+                self._icon_img = ImageTk.PhotoImage(img)
+                self.iconphoto(True, self._icon_img)
+        except Exception as e:
+            Logger.log(f"设置窗口图标失败: {e}")
     
     def _load_whale(self, fname, max_w, target_h=640):
         """加载并缩放鲸鱼娘立绘（高度填满 target_h，宽度不超过 max_w）"""
@@ -442,21 +571,23 @@ class App(ttk.Window):
     
     def _build_ui(self):
         # ===== 顶部标题栏 =====
-        header = ttk.Frame(self, padding=(18, 14, 14, 8))
+        header = ttk.Frame(self, padding=(18, 12, 14, 8))
         header.pack(fill=X)
-        
-        ttk.Label(header, text="🐳 transformed", font=("", 22, "bold"),
-                 bootstyle="inverse-primary").pack(side=LEFT)
-        ttk.Label(header, text="格式转换 · 视频下载 · 深海女仆工坊",
-                 font=("", 10), bootstyle="secondary").pack(side=LEFT, padx=12, pady=(6, 0))
-        
+
+        ttk.Label(header, text="🐳 transformed", font=(UI_FONT, 20, "bold"),
+                 bootstyle="primary").pack(side=LEFT)
+        ttk.Label(header, text=f"格式转换 · 视频下载 · 深海女仆工坊   {APP_VERSION}",
+                 font=(UI_FONT, 10), bootstyle="secondary").pack(side=LEFT, padx=10, pady=(8, 0))
+
         # 设置按钮
         ttk.Button(header, text="⚙ 输出目录",
                   command=self._set_output, bootstyle="outline").pack(side=RIGHT, padx=2)
         ttk.Button(header, text="⟳", width=3,
                   command=lambda: self.history_tree_refresh(),
                   bootstyle="outline").pack(side=RIGHT, padx=2)
-        
+
+        ttk.Separator(self).pack(fill=X, padx=14)
+
         # ===== 主区域（两侧看板娘 + 中间内容） =====
         mid = ttk.Frame(self)
         mid.pack(fill=BOTH, expand=True, padx=6, pady=2)
@@ -487,9 +618,10 @@ class App(ttk.Window):
         # ===== 底部状态栏 =====
         status = ttk.Frame(self, padding=(15, 4))
         status.pack(fill=X, side=BOTTOM)
+        ttk.Separator(self).pack(fill=X, side=BOTTOM)
         self.status = ttk.Label(status, text="🐳 就绪", bootstyle="secondary")
         self.status.pack(side=LEFT)
-        ttk.Label(status, text="transformed Desktop v1.2 · 深海女仆工坊",
+        ttk.Label(status, text=f"transformed Desktop {APP_VERSION} · 深海女仆工坊",
                  bootstyle="secondary").pack(side=RIGHT)
     
     def _build_left(self, parent):
@@ -515,8 +647,8 @@ class App(ttk.Window):
         
         # WebP
         self._make_converter_card(tab1, "WebP → JPG", "webp",
-            "将 WebP 图片批量转换为 JPEG 格式",
-            lambda: self._pick("webp", [("WebP", "*.webp")]),
+            "将 WebP 图片批量转换为 JPEG 格式（也支持 png/jpg/gif/bmp/tiff 输入）",
+            lambda: self._pick("webp", [("图片", "*.webp *.png *.jpg *.jpeg *.gif *.bmp *.tiff")]),
             lambda: self._convert("webp"))
         
         # --- Tab 2: 网络下载 ---
@@ -528,14 +660,14 @@ class App(ttk.Window):
         song_box.pack(fill=X, pady=(0, 10))
 
         ttk.Label(song_box, text="输入歌手 / 歌名，自动搜索下载 MP3",
-                 font=("", 10), bootstyle="secondary").pack(anchor=W)
+                 font=(UI_FONT, 10), bootstyle="secondary").pack(anchor=W)
 
         song_frame = ttk.Frame(song_box)
         song_frame.pack(fill=X, pady=5)
 
         self.song_var = tk.StringVar()
         song_entry = ttk.Entry(song_frame, textvariable=self.song_var,
-                             font=("", 11))
+                             font=(UI_FONT, 11))
         song_entry.pack(fill=X, side=LEFT, expand=True)
         song_entry.bind("<Return>", lambda e: self._start_song_search())
 
@@ -543,17 +675,17 @@ class App(ttk.Window):
                   bootstyle="warning", command=self._start_song_search).pack(side=RIGHT, padx=5)
 
         ttk.Label(song_box, text="搜索来源: B站优先（国内直连），暂无则手机外站兜底。",
-                 font=("", 9), bootstyle="secondary").pack(anchor=W)
+                 font=(UI_FONT, 9), bootstyle="secondary").pack(anchor=W)
 
         # ---- 视频链接批量下载 ----
         url_box = ttk.Labelframe(tab2, text="🎬 视频链接下载（支持批量）", padding=12)
         url_box.pack(fill=X, pady=(0, 8))
 
         ttk.Label(url_box, text="每行一个链接，支持 B站/BV号/AV号/b23短链/YouTube/X/直链",
-                 font=("", 9), bootstyle="secondary").pack(anchor=W, pady=(0, 4))
+                 font=(UI_FONT, 9), bootstyle="secondary").pack(anchor=W, pady=(0, 4))
 
         # 多行文本输入框
-        self.url_text = tk.Text(url_box, height=4, font=("", 10),
+        self.url_text = tk.Text(url_box, height=4, font=(UI_FONT, 10),
                                 bg="#1a1a2e", fg="#e0e0e0", insertbackground="#e0e0e0",
                                 wrap=tk.WORD, relief=tk.FLAT, padx=8, pady=6)
         self.url_text.pack(fill=X, pady=(0, 6))
@@ -585,19 +717,17 @@ class App(ttk.Window):
         queue_box.pack(fill=BOTH, expand=True, pady=(0, 8))
 
         # Treeview
-        q_cols = ("idx", "status", "name", "progress", "action")
+        q_cols = ("idx", "status", "name", "progress")
         self.queue_tree = ttk.Treeview(queue_box, columns=q_cols, show="headings",
                                        height=8, bootstyle="info", selectmode="extended")
         self.queue_tree.heading("idx", text="#")
         self.queue_tree.heading("status", text="状态")
         self.queue_tree.heading("name", text="文件名 / URL")
         self.queue_tree.heading("progress", text="进度")
-        self.queue_tree.heading("action", text="操作")
         self.queue_tree.column("idx", width=40, anchor=CENTER, stretch=False)
-        self.queue_tree.column("status", width=80, anchor=CENTER, stretch=False)
-        self.queue_tree.column("name", width=280)
-        self.queue_tree.column("progress", width=70, anchor=CENTER, stretch=False)
-        self.queue_tree.column("action", width=60, anchor=CENTER, stretch=False)
+        self.queue_tree.column("status", width=90, anchor=CENTER, stretch=False)
+        self.queue_tree.column("name", width=320)
+        self.queue_tree.column("progress", width=90, anchor=CENTER, stretch=False)
         self.queue_tree.tag_configure("waiting", foreground="#8899aa")
         self.queue_tree.tag_configure("downloading", foreground="#00ccff")
         self.queue_tree.tag_configure("done", foreground="#44cc44")
@@ -607,8 +737,9 @@ class App(ttk.Window):
         self.queue_tree.configure(yscrollcommand=q_scroll.set)
         self.queue_tree.pack(side=LEFT, fill=BOTH, expand=True)
         q_scroll.pack(side=RIGHT, fill=Y)
-        # 键盘 Delete 删除
+        # 键盘 Delete 删除；双击失败行看错误详情，双击完成行直接打开文件
         self.queue_tree.bind("<Delete>", lambda e: self._queue_delete_selected())
+        self.queue_tree.bind("<Double-1>", self._on_queue_double_click)
         # 右键菜单
         self._queue_menu = tk.Menu(self, tearoff=0)
         self._queue_menu.add_command(label="▶ 开始下载", command=self._start_queue)
@@ -638,22 +769,25 @@ class App(ttk.Window):
         prog_box = ttk.Labelframe(tab2, text="📊 下载进度", padding=8)
         prog_box.pack(fill=X)
 
-        self.dl_total_label = ttk.Label(prog_box, text="总进度: 0/0", font=("", 9))
+        self.dl_total_label = ttk.Label(prog_box, text="总进度: 0/0",
+                                        font=(UI_FONT, 9))
         self.dl_total_label.pack(anchor=W)
-        self.dl_total_prog = ttk.Progressbar(prog_box, mode="determinate", bootstyle="success")
+        self.dl_total_prog = ttk.Progressbar(prog_box, mode="determinate",
+                                             bootstyle="success-striped")
         self.dl_total_prog.pack(fill=X, pady=2)
 
-        ttk.Label(prog_box, text="当前:", font=("", 9)).pack(anchor=W, pady=(4, 0))
-        self.dl_prog = ttk.Progressbar(prog_box, mode="determinate", bootstyle="info")
+        ttk.Label(prog_box, text="当前:", font=(UI_FONT, 9)).pack(anchor=W, pady=(4, 0))
+        self.dl_prog = ttk.Progressbar(prog_box, mode="determinate",
+                                       bootstyle="info-striped")
         self.dl_prog.pack(fill=X, pady=2)
-        self.dl_stat = ttk.Label(prog_box, text="")
+        self.dl_stat = ttk.Label(prog_box, text="", font=(UI_FONT, 9))
         self.dl_stat.pack(anchor=W)
 
         # 支持列表
         info = ttk.Frame(tab2, padding=(6, 6, 6, 0))
         info.pack(fill=X, pady=(4, 0))
         ttk.Label(info, text="✅ 支持的平台",
-                 font=("", 11, "bold")).pack(anchor=W)
+                 font=(UI_FONT, 11, "bold")).pack(anchor=W)
         for line in ["• Bilibili — BV/AV号或完整链接",
                      "• YouTube — youtube.com / youtu.be",
                      "• Twitter/X — twitter.com / x.com",
@@ -676,48 +810,41 @@ class App(ttk.Window):
         self.log_text.pack(fill=BOTH, expand=True, pady=5)
     
     def _make_converter_card(self, parent, title, key, desc, pick_fn, conv_fn):
-        """创建转换卡片"""
+        """创建转换卡片（带标题的分组框）"""
         icons = {"epub": "📖", "mp4": "🎬", "webp": "🖼️"}
-        tip = {"epub": "电子书转纯文本", "mp4": "提取视频音频", "webp": "图片转 JPEG"}
-        
-        card = ttk.Frame(parent, padding=12, bootstyle="secondary")
+
+        card = ttk.Labelframe(parent, text=f" {icons.get(key, '📁')} {title} ",
+                              padding=(12, 8), bootstyle="primary")
         card.pack(fill=X, pady=7)
-        
-        # 标题行
-        hdr = ttk.Frame(card)
-        hdr.pack(fill=X)
-        ttk.Label(hdr, text=f"{icons.get(key, '📁')} {title}", font=("", 14, "bold"),
-                 bootstyle="inverse-primary").pack(side=LEFT, padx=(2, 8))
-        ttk.Label(hdr, text=tip.get(key, ""), font=("", 9),
-                 bootstyle="secondary").pack(side=LEFT, pady=(4, 0))
-        
+
+        ttk.Label(card, text=desc, font=(UI_FONT, 9),
+                 bootstyle="secondary").pack(anchor=W)
+
         self.convert_cards[key] = {
             "files": [],
-            "label": ttk.Label(hdr, text="未选择文件", bootstyle="secondary"),
-            "progress": ttk.Progressbar(card, mode="determinate", bootstyle="success"),
-            "status": ttk.Label(card, text=""),
+            "label": ttk.Label(card, text="未选择文件", bootstyle="secondary"),
+            "progress": ttk.Progressbar(card, mode="determinate",
+                                        bootstyle="success-striped"),
+            "status": ttk.Label(card, text="", font=(UI_FONT, 9)),
             "pick_fn": pick_fn,
             "conv_fn": conv_fn,
         }
-        
-        self.convert_cards[key]["label"].pack(side=RIGHT, padx=10)
-        
-        ttk.Label(card, text=desc, bootstyle="secondary").pack(anchor=W, pady=2)
-        
+
         btn_frame = ttk.Frame(card)
-        btn_frame.pack(fill=X, pady=5)
-        
+        btn_frame.pack(fill=X, pady=6)
+
         ttk.Button(btn_frame, text="📂 选择文件",
-                  command=pick_fn, bootstyle="primary-outline").pack(side=LEFT, padx=2)
+                  command=pick_fn, bootstyle="outline").pack(side=LEFT, padx=(0, 6))
         ttk.Button(btn_frame, text="▶ 开始转换",
-                  command=conv_fn, bootstyle="success").pack(side=LEFT, padx=2)
-        
-        self.convert_cards[key]["progress"].pack(fill=X, pady=4)
+                  command=conv_fn, bootstyle="success").pack(side=LEFT)
+        self.convert_cards[key]["label"].pack(side=RIGHT, padx=2)
+
+        self.convert_cards[key]["progress"].pack(fill=X, pady=(2, 3))
         self.convert_cards[key]["status"].pack(anchor=W)
     
     # ---- 右侧历史 ----
     def _build_right(self, parent):
-        ttk.Label(parent, text="📜 转换记录", font=("", 14, "bold"),
+        ttk.Label(parent, text="📜 转换记录", font=(UI_FONT, 14, "bold"),
                  bootstyle="inverse-secondary").pack(fill=X, pady=(2, 5))
         
         # 筛选
@@ -843,14 +970,13 @@ class App(ttk.Window):
                 def mk_cb(i, f):
                     def cb(pct, msg):
                         overall = (i / total) + (pct / total)
-                        # Coalesce background progress notifications; never nest Tk's event loop.
+                        # 转换进度只写自己的卡片，不再串扰底部下载进度区
+                        # （下载与转换可能并行进行，各自更新各自的进度）
                         self._schedule_progress_ui(
                             "conversion",
-                            lambda p=overall, n=i, fn=Path(f).name, m=msg, t=typ_name: (
+                            lambda p=overall, n=i, fn=Path(f).name, m=msg: (
                                 ct["progress"].config(value=min(p * 100, 100)),
                                 ct["status"].config(text=f"[{n+1}/{total}] {fn}: {m}"),
-                                self.dl_prog.config(value=min(p * 100, 100)),
-                                self.dl_stat.config(text=f"{t}: [{n+1}/{total}]"),
                             ),
                         )
                     return cb
@@ -872,7 +998,6 @@ class App(ttk.Window):
             self._run_on_ui("conversion-finished", lambda k=ct: (
                 k["label"].config(text="完成 ✓"),
                 k["progress"].config(value=0),
-                self.dl_prog.config(value=0),
                 self.history_tree_refresh(),
                 self._log_refresh()))
             skip_note = f"（跳过 {skipped_count} 个已是目标格式的文件）" if skipped_count else ""
@@ -897,8 +1022,8 @@ class App(ttk.Window):
                 if text: texts.append(text)
                 cb(0.1 + (i/len(items))*0.8, f"解析 {i+1}/{len(items)}")
             cb(0.9, "写入文件...")
-            with open(out, "w", encoding="utf-8") as f:
-                f.write("\n\n".join(texts))
+            out = _validated_output_file(out, out_dir)
+            Path(out).write_text("\n\n".join(texts), encoding="utf-8")
             cb(1.0, "完成")
             return True, str(out)
         except Exception as e:
@@ -915,7 +1040,10 @@ class App(ttk.Window):
             cmd = [ffmpeg, "-i", str(path), "-vn",
                    "-acodec", "libmp3lame", "-ab", "192k",
                    "-y", str(out)]
-            proc = subprocess.run(cmd, capture_output=True)
+            # GUI(pythonw) 模式下防止 ffmpeg 弹出黑色控制台窗口
+            no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            proc = subprocess.run(cmd, capture_output=True, shell=False,
+                                  creationflags=no_window)
             if proc.returncode != 0:
                 err = (proc.stderr or b"").decode("utf-8", errors="replace")[-300:]
                 return False, f"ffmpeg 转换失败(code={proc.returncode}): {err}"
@@ -970,7 +1098,11 @@ class App(ttk.Window):
                 if self._ui_closing:
                     return
                 raise
-        self._ui_drain_after_id = self.after(50, self._drain_progress_events)
+        try:
+            self._ui_drain_after_id = self.after(50, self._drain_progress_events)
+        except tk.TclError:
+            # 窗口恰好在排空回调中销毁，安静退出即可
+            pass
 
     def _on_close(self):
         """Stop accepting worker UI work before destroying the Tk root."""
@@ -989,8 +1121,8 @@ class App(ttk.Window):
 
     # ========== 下载队列相关 ==========
     _STATUS_ICONS = {
-        "waiting": "○", "downloading": "▶", "done": "✓",
-        "failed": "✗", "retrying": "↻",
+        "waiting": "○ 等待中", "downloading": "▶ 下载中", "done": "✓ 完成",
+        "failed": "✗ 失败", "retrying": "↻ 重试中",
     }
 
     def _on_url_text_focus_in(self, event=None):
@@ -1007,7 +1139,9 @@ class App(ttk.Window):
     def _set_url_placeholder(self, show):
         if show:
             content = self.url_text.get("1.0", tk.END).strip()
-            if not content:
+            # 空框或占位符已在显示 → 统一恢复为占位符状态（幂等，
+            # 防止窗口切换等重复 FocusOut 把"显示占位符"误标为真实内容）
+            if not content or content == self._url_placeholder.strip():
                 self.url_text.delete("1.0", tk.END)
                 self.url_text.insert("1.0", self._url_placeholder)
                 self.url_text.config(fg="#667788")
@@ -1024,7 +1158,8 @@ class App(ttk.Window):
             return []
         self._set_url_placeholder(False)
         raw = self.url_text.get("1.0", tk.END).strip()
-        if not raw:
+        # 双保险：内容就是占位符文字时绝不当成链接
+        if not raw or raw == self._url_placeholder.strip():
             return []
         lines = [l.strip() for l in raw.splitlines() if l.strip()]
         # 去重保序
@@ -1037,32 +1172,45 @@ class App(ttk.Window):
         return urls
 
     def _start_dl(self):
-        """将文本框中的链接添加到下载队列"""
+        """将文本框中的链接添加到下载队列（自动跳过队列中已有的待处理链接）"""
         urls = self._get_urls_from_text()
         if not urls:
             self.show_toast("提示", "请输入至少一个视频链接", "warning")
             return
         is_mp3 = self.dl_type.get() == "mp3"
-        added = 0
+        added = skipped = 0
         with self.dl_queue_lock:
+            existing = {it["url"] for it in self.dl_queue
+                        if it["status"] in ("waiting", "retrying", "downloading")}
             for url in urls:
+                if url in existing:
+                    skipped += 1
+                    continue
+                existing.add(url)
                 self.dl_queue.append({
                     "url": url, "is_mp3": is_mp3,
                     "status": "waiting", "name": url[:80], "error": "",
                     "progress": "",
                 })
                 added += 1
+        if added == 0:
+            self.show_toast("提示", "所选链接已在队列中等待下载，未重复添加", "warning")
+            return
+        note = f"（跳过 {skipped} 个重复链接）" if skipped else ""
         self._run_on_ui("queue-refresh", self._queue_refresh_tree)
-        self.status.config(text=f"已添加 {added} 个链接到队列")
-        self.show_toast("已添加", f"已将 {added} 个链接加入下载队列", "info")
+        self.status.config(text=f"已添加 {added} 个链接到队列{note}")
+        self.show_toast("已添加", f"已将 {added} 个链接加入下载队列{note}", "info")
         # 清空输入框
         self.url_text.delete("1.0", tk.END)
         self._set_url_placeholder(True)
-        # 自动启动队列 worker
-        self._start_queue_worker()
 
     def _start_queue(self):
         """手动点击开始下载"""
+        with self.dl_queue_lock:
+            has_work = any(it["status"] in ("waiting", "retrying") for it in self.dl_queue)
+        if not has_work:
+            self.show_toast("提示", "队列中没有待下载的任务，请先添加链接", "warning")
+            return
         self._start_queue_worker()
 
     def _start_queue_worker(self):
@@ -1209,8 +1357,15 @@ class App(ttk.Window):
             cb(0.2, "下载中...")
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(ready_url, download=True)
+                # ytsearch 等来源返回 playlist 包装；不拆包的话
+                # prepare_filename 会按播放列表名拼出错误文件路径
+                if isinstance(info, dict) and info.get("_type") in ("playlist", "multi_video"):
+                    entries = [e for e in (info.get("entries") or []) if e]
+                    if not entries:
+                        raise RuntimeError("未找到可下载的视频条目")
+                    info = entries[0]
+                fn = ydl.prepare_filename(info)
 
-            fn = ydl.prepare_filename(info)
             if is_mp3:
                 fn = str(Path(fn).with_suffix(".mp3"))
 
@@ -1305,9 +1460,9 @@ class App(ttk.Window):
         dlg.grab_set()
 
         ttk.Label(dlg, text=f"🔍 搜索: {query}  （共 {len(results)} 条结果）",
-                  font=("", 11, "bold"), bootstyle="info").pack(padx=12, pady=(12, 6), anchor=W)
-        ttk.Label(dlg, text="点击选中后自动加入下载队列",
-                  font=("", 9), bootstyle="secondary").pack(padx=12, anchor=W)
+                  font=(UI_FONT, 11, "bold"), bootstyle="info").pack(padx=12, pady=(12, 6), anchor=W)
+        ttk.Label(dlg, text="点击选中后自动开始下载 MP3",
+                  font=(UI_FONT, 9), bootstyle="secondary").pack(padx=12, anchor=W)
 
         # 结果列表
         tree = ttk.Treeview(dlg, columns=("idx", "title", "author", "duration"),
@@ -1369,45 +1524,82 @@ class App(ttk.Window):
             _sp.Popen(["xdg-open", self.output_dir] if os.name != "nt" else ["explorer", self.output_dir])
 
     def _queue_refresh_tree(self):
-        """刷新队列 Treeview + 总进度"""
-        for item in self.queue_tree.get_children():
-            self.queue_tree.delete(item)
+        """刷新队列 Treeview + 总进度。
+
+        原地更新每行的值而不是整表重建，避免下载过程中高频刷新
+        不断清空用户的多选与滚动位置。
+        """
+        rows = []
         with self.dl_queue_lock:
             total = len(self.dl_queue)
             done_count = sum(1 for it in self.dl_queue if it["status"] == "done")
             failed_count = sum(1 for it in self.dl_queue if it["status"] == "failed")
             for i, it in enumerate(self.dl_queue):
-                icon = self._STATUS_ICONS.get(it["status"], "?")
-                status_text = f"{icon} {it['status']}"
+                status_text = self._STATUS_ICONS.get(it["status"], f"? {it['status']}")
                 name_text = it["name"][:50] if it["name"] else it["url"][:50]
                 progress_text = it.get("progress", "")
                 if it["status"] == "done":
                     progress_text = "✓"
                 elif it["status"] == "failed":
                     progress_text = "✗"
-                self.queue_tree.insert("", END, iid=str(i),
-                                       tags=(it["status"],),
-                                       values=(i + 1, status_text, name_text, progress_text, ""))
+                rows.append((str(i), (it["status"],),
+                             (str(i + 1), status_text, name_text, progress_text)))
+        wanted = set()
+        for iid, tags, values in rows:
+            wanted.add(iid)
+            if self.queue_tree.exists(iid):
+                if tuple(self.queue_tree.item(iid, "tags")) != tags:
+                    self.queue_tree.item(iid, tags=tags)
+                if tuple(self.queue_tree.item(iid, "values")) != values:
+                    self.queue_tree.item(iid, values=values)
+            else:
+                self.queue_tree.insert("", END, iid=iid, tags=tags, values=values)
+        for iid in set(self.queue_tree.get_children()) - wanted:
+            self.queue_tree.delete(iid)
         self.dl_total_label.config(text=f"总进度: {done_count}/{total}  ✗ {failed_count}")
         self.dl_total_prog.config(value=(done_count / max(total, 1)) * 100)
+
+    def _on_queue_double_click(self, event):
+        """双击队列行：失败项查看错误详情，完成项直接打开文件"""
+        iid = self.queue_tree.identify_row(event.y)
+        if not iid:
+            return
+        idx = int(iid)
+        with self.dl_queue_lock:
+            if not (0 <= idx < len(self.dl_queue)):
+                return
+            it = dict(self.dl_queue[idx])
+        if it["status"] == "failed":
+            self._show_toast_ui("下载失败详情",
+                                f"{it.get('name', '') or it.get('url', '')}\n\n{it.get('error') or '未知错误'}",
+                                "error")
+        elif it["status"] == "done":
+            path = Path(self.output_dir) / it.get("name", "")
+            if path.exists():
+                try:
+                    os.startfile(path)
+                except Exception:
+                    pass
 
     def _show_queue_menu(self, event):
         iid = self.queue_tree.identify_row(event.y)
         if iid and iid not in self.queue_tree.selection():
             self.queue_tree.selection_set(iid)
-        self._queue_menu.tk_popup(event.x_root, event.y_root)
+        try:
+            self._queue_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._queue_menu.grab_release()
 
     def _queue_move(self, direction):
         sel = self.queue_tree.selection()
         if not sel:
             return
         with self.dl_queue_lock:
-            for iid in sel:
-                idx = int(iid)
-                new_idx = idx + direction
-                if 0 <= new_idx < len(self.dl_queue):
-                    self.dl_queue[idx], self.dl_queue[new_idx] = \
-                        self.dl_queue[new_idx], self.dl_queue[idx]
+            n = len(self.dl_queue)
+            blocked = [i for i, it in enumerate(self.dl_queue)
+                       if it["status"] == "downloading"]
+            order = compute_queue_move(n, [int(i) for i in sel], direction, blocked)
+            self.dl_queue = [self.dl_queue[i] for i in order]
         self._queue_refresh_tree()
 
     def _queue_retry_selected(self):
@@ -1457,12 +1649,15 @@ class App(ttk.Window):
         row = 0
         for idx in range(len(items) - 1, -1, -1):
             h = items[idx]
-            if tag != "全部" and tag not in h["type"]:
+            if not isinstance(h, dict):
                 continue
-            s = "✓" if h["ok"] else "✗"
+            typ = str(h.get("type", ""))
+            if tag != "全部" and tag not in typ:
+                continue
+            s = "✓" if h.get("ok") else "✗"
             self.tree.insert("", END, iid=str(idx),
                              tags=("even" if row % 2 == 0 else "odd",),
-                             values=(h["time"], h["name"][:25], h["type"], s))
+                             values=(h.get("time", ""), str(h.get("name", ""))[:25], typ, s))
             row += 1
     
     def _history_delete_selected(self):
@@ -1473,15 +1668,11 @@ class App(ttk.Window):
             return
         if not messagebox.askyesno("确认", f"确定删除选中的 {len(sel)} 条记录？"):
             return
-        # iid 即 history.items 的原始索引；倒序删除避免索引位移
-        for iid in sorted(sel, key=int, reverse=True):
-            idx = int(iid)
-            if 0 <= idx < len(self.history.items):
-                del self.history.items[idx]
-        self.history.save()
+        # iid 即 history.items 的原始索引，交给 History.delete 持锁倒序删除
+        removed = self.history.delete(int(iid) for iid in sel)
         self.history_tree_refresh()
-        self.status.config(text=f"已删除 {len(sel)} 条记录")
-        Logger.log(f"🗑 删除历史记录 {len(sel)} 条")
+        self.status.config(text=f"已删除 {removed} 条记录")
+        Logger.log(f"🗑 删除历史记录 {removed} 条")
     
     def _history_clear(self):
         if messagebox.askyesno("确认", "清空所有记录?"):
@@ -1498,7 +1689,8 @@ class App(ttk.Window):
         self.log_text.delete(1.0, END)
         try:
             with _LOG_LOCK:
-                open(LOG_FILE, "w", encoding="utf-8").close()
+                Path(_validated_output_file(LOG_FILE, Path.home())).write_text(
+                    "", encoding="utf-8")
         except:
             pass
 
