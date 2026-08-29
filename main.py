@@ -1158,12 +1158,11 @@ class App(ttk.Window):
                     pass
             self._dl_pcts.pop(uid, None)
 
-    def _start_dl(self):
-        """将文本框中的链接添加到下载队列（自动跳过队列中已有的待处理链接）"""
+    def _enqueue_urls(self):
+        """把输入框中的链接加入队列（跨批次去重）。返回 (新增数, 跳过数)"""
         urls = self._get_urls_from_text()
         if not urls:
-            self.show_toast("提示", "请输入至少一个视频链接", "warning")
-            return
+            return 0, 0
         is_mp3 = self.dl_type.get() == "mp3"
         added = skipped = 0
         with self.dl_queue_lock:
@@ -1181,24 +1180,33 @@ class App(ttk.Window):
                     "progress": "",
                 })
                 added += 1
+        if added:
+            self._run_on_ui("queue-refresh", self._queue_refresh_tree)
+            self.url_text.delete("1.0", tk.END)
+            self._set_url_placeholder(True)
+        return added, skipped
+
+    def _start_dl(self):
+        """将输入框中的链接添加到下载队列（不自动开始）"""
+        added, skipped = self._enqueue_urls()
         if added == 0:
-            self.show_toast("提示", "所选链接已在队列中等待下载，未重复添加", "warning")
+            self.show_toast("提示", "没有新增链接：请输入链接，或所选链接已在队列中", "warning")
             return
         note = f"（跳过 {skipped} 个重复链接）" if skipped else ""
-        self._run_on_ui("queue-refresh", self._queue_refresh_tree)
         self.status.config(text=f"已添加 {added} 个链接到队列{note}")
         self.show_toast("已添加", f"已将 {added} 个链接加入下载队列{note}", "info")
-        # 清空输入框
-        self.url_text.delete("1.0", tk.END)
-        self._set_url_placeholder(True)
 
     def _start_queue(self):
-        """手动点击开始下载"""
+        """开始下载：输入框中的链接直接入队并开始下载"""
+        added, skipped = self._enqueue_urls()
         with self.dl_queue_lock:
             has_work = any(it["status"] in ("waiting", "retrying") for it in self.dl_queue)
         if not has_work:
-            self.show_toast("提示", "队列中没有待下载的任务，请先添加链接", "warning")
+            self.show_toast("提示", "没有可下载的任务：请先在输入框粘贴链接", "warning")
             return
+        if added:
+            note = f"，新增 {added} 个" + (f"（跳过 {skipped} 个重复）" if skipped else "")
+            self.status.config(text=f"已从输入框入队{note}，开始下载")
         self._ensure_workers()
 
     def _ensure_workers(self):
