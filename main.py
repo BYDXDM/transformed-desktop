@@ -7,7 +7,7 @@ transformed - Win7 版 (纯 tkinter，无 ttkbootstrap)
 """
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading, os, sys, json, re, shutil, subprocess
+import threading, os, sys, json, re, shutil, subprocess, zipfile
 from pathlib import Path
 from datetime import datetime
 
