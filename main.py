@@ -32,6 +32,29 @@ import ipaddress
 import socket
 
 
+_LOOPBACK_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
+_PROXY_SCHEMES = ("http", "https", "ftp")
+
+
+def _filtered_proxies():
+    """Remove only loopback proxies that commonly cause WinError 10061."""
+    proxies = _urlreq.getproxies()
+    filtered = {}
+    for scheme in _PROXY_SCHEMES:
+        value = proxies.get(scheme)
+        if not value:
+            continue
+        try:
+            hostname = (urllib.parse.urlparse(value).hostname or "").lower()
+        except ValueError:
+            hostname = ""
+        if hostname not in _LOOPBACK_PROXY_HOSTS:
+            filtered[scheme] = value
+    if proxies.get("no"):
+        filtered["no"] = proxies["no"]
+    return filtered
+
+
 def _assert_public_http_url(url):
     """仅允许 http/https，且主机必须解析到公网地址（防内网/本机请求）。"""
     parsed = urllib.parse.urlsplit(url)
@@ -65,7 +88,10 @@ def guarded_urlopen(req, timeout):
     _assert_public_http_url(url)
     with _GUARDED_OPENER_LOCK:
         if _GUARDED_OPENER is None:
-            _GUARDED_OPENER = _urlreq.build_opener(_GuardedRedirectHandler())
+            _GUARDED_OPENER = _urlreq.build_opener(
+                _urlreq.ProxyHandler(_filtered_proxies()),
+                _GuardedRedirectHandler(),
+            )
     return _GUARDED_OPENER.open(req, timeout=timeout)
 
 HISTORY_FILE = Path.home() / ".transformed_history.json"
