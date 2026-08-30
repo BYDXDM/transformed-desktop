@@ -340,7 +340,12 @@ def download_ffmpeg(progress_cb=None):
     zip_path = dest / "ffmpeg.zip"
     try:
         progress_cb and progress_cb("下载 ffmpeg (~30MB)...")
-        urllib.request.urlretrieve(url, zip_path)
+        with guarded_urlopen(url, timeout=120) as r, open(zip_path, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
         progress_cb and progress_cb("解压...")
         ext = dest / "_extract"
         ext.mkdir(exist_ok=True)
