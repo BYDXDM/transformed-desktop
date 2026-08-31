@@ -353,13 +353,15 @@ def download_ffmpeg(progress_cb=None):
             z.extractall(ext)
         bin_dir = None
         for d in ext.iterdir():
-            if (d / "bin").exists():
+            if (d / "bin").is_dir():
                 bin_dir = d / "bin"
                 break
-        if bin_dir:
-            target = dest / "bin"
-            target.mkdir(exist_ok=True)
-            for f in bin_dir.iterdir():
+        if not bin_dir:
+            raise RuntimeError("ffmpeg 压缩包中未找到 bin 目录")
+        target = dest / "bin"
+        target.mkdir(exist_ok=True)
+        for f in bin_dir.iterdir():
+            if f.is_file():
                 shutil.copy2(f, target / f.name)
         shutil.rmtree(ext, ignore_errors=True)
         zip_path.unlink(missing_ok=True)
@@ -416,6 +418,7 @@ class App(tk.Tk):
         self._style_config()
         self.history = History()
         self.task_running = False
+        self._closing = False
         self.output_dir = str(Path.home() / "Downloads" / "transformed_output")
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -464,16 +467,25 @@ class App(tk.Tk):
         self._set_status("下载并安装 ffmpeg...")
         threading.Thread(target=self._dl_ffmpeg_thread, daemon=True).start()
 
+    def _ui_after(self, callback):
+        """Avoid scheduling Tk callbacks after the Win7 window is closed."""
+        if self._closing:
+            return
+        try:
+            self.after(0, callback)
+        except tk.TclError:
+            pass
+
     def _dl_ffmpeg_thread(self):
         ok, result = download_ffmpeg(
-            lambda msg: self.after(0, lambda m=msg: self._set_status(m)))
+            lambda msg: self._ui_after(lambda m=msg: self._set_status(m)))
         self.task_running = False
         if ok:
-            self.after(0, lambda: (
+            self._ui_after(lambda: (
                 self._set_status("ffmpeg 安装完成"),
                 messagebox.showinfo("成功", "ffmpeg 已安装!")))
         else:
-            self.after(0, lambda r=result: (
+            self._ui_after(lambda r=result: (
                 self._set_status("ffmpeg 安装失败"),
                 messagebox.showerror("失败", r)))
 
@@ -1045,15 +1057,9 @@ class App(tk.Tk):
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 shell=False, creationflags=no_window)
-        try:
-            proc.wait()
-        finally:
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
+        stdout_data, stderr_data = proc.communicate()
         if proc.returncode != 0:
-            err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-300:]
+            err = (stderr_data or stdout_data or b"").decode("utf-8", errors="replace")[-300:]
             raise RuntimeError("ffmpeg 处理失败(code=%d): %s" % (proc.returncode, err))
 
     def _download_bili_direct(self, item, media, is_mp3, cb):
@@ -1428,6 +1434,10 @@ class App(tk.Tk):
         for line in log_read()[-200:]:
             self.log_text.insert("end", line + "\n")
         self.log_text.see("end")
+
+    def destroy(self):
+        self._closing = True
+        super().destroy()
 
     def _log_clear(self):
         self.log_text.delete(1.0, "end")
