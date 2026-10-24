@@ -11,21 +11,29 @@ REPO = "BYDXDM/transformed-desktop"
 # 发布始终从 master 切 tag；不指定的话 GitHub 会把新 tag 打在默认分支 HEAD 上
 BRANCH = "master"
 EXE = "dist/transformed.exe"
-TAG = "v1.6.2"
-NAME = "transformed Desktop v1.6.2"
-BODY = """## transformed Desktop v1.6.2
+TAG = "v1.7.0"
+NAME = "transformed Desktop v1.7.0"
+BODY = """## transformed Desktop v1.7.0
 
-### 交互优化
-- ▶ **点击"开始下载"直接下载**：输入框粘贴链接后一键开始，无需先点"添加到队列"
-- "添加到队列"保留：只入队不启动，适合攒一批再下载
-- 队列已有任务时，新输入的链接会自动追加一起下载
+### 全新界面（Win10 Fluent 风格）
+- 全套视觉重做：左侧导航栏（格式转换 / 视频下载 / 历史记录 / 运行日志）+ 系统强调蓝，方角按钮、细进度条、卡片式布局，更接近 Windows 10 原生观感
+- 深色 / 浅色双主题，跟随切换深色标题栏；看板娘移入侧边栏常驻
+- 支持 Segoe UI 字体与 Segoe MDL2 系统图标
 
-### v1.6.1 修复回顾
+### 下载可靠性修复
+- 外网探测失败自动重试，且失败只短缓存 30 秒：代理出口轮换的瞬时抖动不再把 X/YouTube 下载挡住 10 分钟
+- 下载中途遇到瞬时网络错误（代理断连/超时）自动重试一次，队列显示"重试中"，断点续传接着下
+
+### 其他
+- 修复点击"清空日志"报错的问题（_LOG_LOCK 未导入）
+- exe 内置看板娘素材（此前版本打包遗漏）
+
+### v1.6.x 修复回顾
 - B站下载 412 风控：绕过网页直取 playurl API 解析 CDN 直链，失败自动回退
-- yt-dlp 升级 2026.8.19；B站请求携带 buvid3 + 完整 Chrome UA
+- 点击"开始下载"直接下载，无需先添加到队列；并行下载 / 拖拽导入 / B站扫码登录
 
 ### 使用方式
-双击 transformed.exe 即可，无需 Python 环境。MP4转MP3 与部分视频合并需要 ffmpeg，程序可自动下载。
+双击 transformed.exe 即可，无需 Python 环境。MP4转MP3 与部分视频合并需要 ffmpeg，程序可自动下载。Win7 用户请继续使用 win7 分支构建。
 """
 
 def main():

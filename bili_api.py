@@ -15,43 +15,53 @@ from net_guard import guarded_urlopen
 BILI_COOKIES_FILE = (Path.home() / ".transformed_cookies.json").resolve()
 BILI_COOKIEFILE = (Path.home() / ".transformed_cookies.txt").resolve()
 
-_FOREIGN_CACHE = {"ts": 0.0, "ok": False, "reason": ""}
-_FOREIGN_CACHE_TTL = 600  # 检测结果缓存 10 分钟，避免每个外网任务都等 5 秒探测
+_FOREIGN_CACHE = {"ts": 0.0, "ok": False, "reason": "", "ttl": 0}
+_FOREIGN_CACHE_TTL = 600  # 成功结果缓存 10 分钟，避免每个外网任务都等 5 秒探测
+_FOREIGN_FAIL_TTL = 30    # 失败只缓存 30 秒：代理出口轮换的瞬时抖动不该封禁外网下载 10 分钟
 
 
 def check_foreign_access():
     """检测当前网络能否访问外网(YouTube等)。返回 (bool, 信息)
     - 能访问外网: (True, 描述)
     - 不能(需代理): (False, 原因描述)
+
+    代理出口（如 WARP）会轮换、间歇性抖动：探测失败先重试一次再下结论，
+    且失败只短缓存，避免一次抖动导致外网下载被"需要代理"挡住 10 分钟。
     """
     now = time.time()
-    if now - _FOREIGN_CACHE["ts"] < _FOREIGN_CACHE_TTL:
+    if now - _FOREIGN_CACHE["ts"] < _FOREIGN_CACHE["ttl"]:
         return _FOREIGN_CACHE["ok"], _FOREIGN_CACHE["reason"]
 
     result = None
-    # 通过 ipinfo 获取出口 IP 归属地
-    try:
-        req = _urlreq.Request("https://ipinfo.io/json",
-                             headers={"User-Agent": "Mozilla/5.0"})
-        with guarded_urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode())
-            country = data.get("country", "")
-            ip = data.get("ip", "?")
-            if country == "CN":
-                result = (False, f"当前 IP({ip})归属中国，直连外网受限，下载 YouTube/X 需代理")
-            else:
-                result = (True, f"当前 IP({ip}) 非中国归属，可访问外网")
-    except Exception:
-        # ipinfo 都连不上，尝试直接测 youtube 连通性
+    for attempt in (1, 2):
+        # 通过 ipinfo 获取出口 IP 归属地
         try:
-            req = _urlreq.Request("https://www.youtube.com",
+            req = _urlreq.Request("https://ipinfo.io/json",
                                  headers={"User-Agent": "Mozilla/5.0"})
             with guarded_urlopen(req, timeout=5) as r:
-                result = (True, "可访问外网(YouTube可达)")
+                data = json.loads(r.read().decode())
+                country = data.get("country", "")
+                ip = data.get("ip", "?")
+                if country == "CN":
+                    result = (False, f"当前 IP({ip})归属中国，直连外网受限，下载 YouTube/X 需代理")
+                else:
+                    result = (True, f"当前 IP({ip}) 非中国归属，可访问外网")
+                break
         except Exception:
-            result = (False, "无法访问外网(YouTube不可达)，可能需要代理")
+            if attempt == 1:
+                time.sleep(2)
+                continue
+            # ipinfo 两次都连不上，尝试直接测 youtube 连通性
+            try:
+                req = _urlreq.Request("https://www.youtube.com",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                with guarded_urlopen(req, timeout=5) as r:
+                    result = (True, "可访问外网(YouTube可达)")
+            except Exception:
+                result = (False, "无法访问外网(YouTube不可达)，可能需要代理")
 
-    _FOREIGN_CACHE.update({"ts": now, "ok": result[0], "reason": result[1]})
+    _FOREIGN_CACHE.update({"ts": now, "ok": result[0], "reason": result[1],
+                           "ttl": _FOREIGN_CACHE_TTL if result[0] else _FOREIGN_FAIL_TTL})
     return result
 
 

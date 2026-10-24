@@ -14,7 +14,8 @@ if sys.stdout and hasattr(sys.stdout, 'encoding'):
         pass
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
+import tkinter.ttk as _std_ttk
+from tkinter import filedialog, messagebox
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import threading
@@ -39,9 +40,11 @@ from ui_helpers import (
 )
 from net_guard import guarded_urlopen
 from app_common import (
-    APP_VERSION, UI_FONT, THEMES, HISTORY_FILE, LOG_FILE,
-    Logger, History, AppSettings, _validated_output_file,
+    APP_VERSION, UI_FONT, PALETTES, THEME_ALIASES, BASE_THEMES,
+    HISTORY_FILE, LOG_FILE, Logger, History, AppSettings,
+    _validated_output_file, _LOG_LOCK,
 )
+import ui_style
 from ffmpeg_tools import download_ffmpeg, get_ffmpeg_path, media_duration
 from bili_api import (
     check_foreign_access,
@@ -57,6 +60,13 @@ from bili_api import (
     BILI_COOKIEFILE,
 )
 import converters
+
+# ttkbootstrap 的 Button/Radiobutton/Progressbar 子类会把 style 参数当 bootstyle
+# 解析并丢弃不认识的关键字（Accent.TButton -> TButton），导致自定义样式失效。
+# 这三类控件一律用原生 ttk 版本，样式由 ui_style.apply_palette 统一定义。
+Button = _std_ttk.Button
+Radiobutton = _std_ttk.Radiobutton
+Progressbar = _std_ttk.Progressbar
 
 # ===== 尝试导入功能库 =====
 try:
@@ -95,13 +105,13 @@ def get_asset(name):
 class App(ttk.Window):
     def __init__(self):
         self.settings = AppSettings()
-        theme = self.settings.get("theme")
-        self._theme = theme if theme in THEMES else "superhero"
+        theme = THEME_ALIASES.get(self.settings.get("theme"), self.settings.get("theme"))
+        self._theme = theme if theme in PALETTES else "deep"
         super().__init__(title=f"transformed 桌面版 {APP_VERSION}",
-                         themename=self._theme)
+                         themename=BASE_THEMES[self._theme])
 
         self.geometry("1280x800")
-        self.minsize(1050, 650)
+        self.minsize(1024, 680)
 
         self.history = History()
         self.task_running = False
@@ -129,15 +139,13 @@ class App(ttk.Window):
             self.max_parallel = 2
         self._progress_events = UiProgressEventQueue()
 
-        # 两侧看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
-        # 目标高度 = 窗口高(800) - header(55) - status(35) - padding(30) ≈ 680
-        self._whale_h = 680
-        self.img_left = self._load_whale("whale_left.webp", 235, self._whale_h)
-        self.img_right = self._load_whale("whale_right.webp", 235, self._whale_h)
+        # 侧边栏看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
+        self.img_side = self._load_whale("whale_left.webp", 210, 420)
         self._set_window_icon()
 
         self._build_ui()
         self._apply_theme_colors()
+        ui_style.style_titlebar(self, dark=self._theme_colors()["dark"])
         self._setup_dragdrop()
         self._update_bili_btn()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -249,267 +257,410 @@ class App(ttk.Window):
         else:
             messagebox.showinfo(title, msg, parent=self)
     
+    # ================= UI 构建 =================
+
+    # ---- 自绘 tk 控件辅助（注册进 _tk_recolor，主题切换时统一重配色） ----
+    def _tframe(self, parent, bg="root"):
+        f = tk.Frame(parent, bg=self._theme_colors()[bg])
+        self._tk_recolor.append((f, ("frame", bg)))
+        return f
+
+    def _tlabel(self, parent, text, font, fg="fg", bg="root", **kw):
+        lbl = tk.Label(parent, text=text, font=font,
+                       bg=self._theme_colors()[bg], fg=self._theme_colors()[fg],
+                       anchor=W, **kw)
+        self._tk_recolor.append((lbl, ("label", fg, bg)))
+        return lbl
+
+    def _card(self, parent):
+        """带 1px 描边的卡片容器"""
+        pal = self._theme_colors()
+        f = tk.Frame(parent, bg=pal["card"],
+                     highlightbackground=pal["border"], highlightthickness=1,
+                     highlightcolor=pal["accent"])
+        self._tk_recolor.append((f, ("frameb", "card")))
+        return f
+
     def _build_ui(self):
-        # ===== 顶部标题栏 =====
-        header = ttk.Frame(self, padding=(18, 12, 14, 8))
-        header.pack(fill=X)
+        pal = self._theme_colors()
+        self._tk_recolor = []
 
-        ttk.Label(header, text="🐳 transformed", font=(UI_FONT, 20, "bold"),
-                 bootstyle="primary").pack(side=LEFT)
-        ttk.Label(header, text=f"格式转换 · 视频下载 · 深海女仆工坊   {APP_VERSION}",
-                 font=(UI_FONT, 10), bootstyle="secondary").pack(side=LEFT, padx=10, pady=(8, 0))
-
-        # 设置按钮
-        ttk.Button(header, text="⚙ 输出目录",
-                  command=self._set_output, bootstyle="outline").pack(side=RIGHT, padx=2)
-        ttk.Button(header, text="⟳", width=3,
-                  command=lambda: self.history_tree_refresh(),
-                  bootstyle="outline").pack(side=RIGHT, padx=2)
-        self.theme_btn = ttk.Button(header, text=THEMES["flatly" if self._theme == "superhero" else "superhero"]["btn"],
-                                    command=self._toggle_theme,
-                                    bootstyle="outline")
-        self.theme_btn.pack(side=RIGHT, padx=2)
-
-        ttk.Separator(self).pack(fill=X, padx=14)
-
-        # ===== 主区域（两侧看板娘 + 中间内容） =====
-        mid = ttk.Frame(self)
-        mid.pack(fill=BOTH, expand=True, padx=6, pady=2)
-        
-        # 左侧鲸鱼娘立绘（底部对齐，显示全身）
-        if self.img_left:
-            ttk.Label(mid, image=self.img_left).pack(side=LEFT, fill=Y, anchor="s")
-        
-        # 右侧鲸鱼娘立绘（底部对齐，显示全身）
-        if self.img_right:
-            ttk.Label(mid, image=self.img_right).pack(side=RIGHT, fill=Y, anchor="s")
-        
-        # 中间内容区
-        main = ttk.Panedwindow(mid, orient=HORIZONTAL)
-        main.pack(fill=BOTH, expand=True, padx=8, pady=4)
-        
-        # 左侧功能面板
-        left = ttk.Frame(main)
-        main.add(left, weight=3)
-        
-        # 右侧历史面板
-        right = ttk.Frame(main)
-        main.add(right, weight=2)
-        
-        self._build_left(left)
-        self._build_right(right)
-        
-        # ===== 底部状态栏 =====
-        status = ttk.Frame(self, padding=(15, 4))
+        # ===== 底部状态栏（先占住底部） =====
+        status = self._tframe(self, "side")
         status.pack(fill=X, side=BOTTOM)
-        ttk.Separator(self).pack(fill=X, side=BOTTOM)
-        self.status = ttk.Label(status, text="🐳 就绪", bootstyle="secondary")
+        ttk.Separator(status).pack(fill=X)
+        srow = self._tframe(status, "side")
+        srow.pack(fill=X, padx=16, pady=5)
+        self.status = ttk.Label(srow, text="就绪", style="SideDim.TLabel")
         self.status.pack(side=LEFT)
-        ttk.Label(status, text=f"transformed Desktop {APP_VERSION} · 深海女仆工坊",
-                 bootstyle="secondary").pack(side=RIGHT)
-    
-    def _build_left(self, parent):
-        """左侧功能面板"""
-        self.nb = nb = ttk.Notebook(parent)
-        nb.pack(fill=BOTH, expand=True)
-        
-        # --- Tab 1: 格式转换 ---
-        tab1 = ttk.Frame(nb, padding=15)
-        nb.add(tab1, text="📁 格式转换")
-        
-        # EPUB
-        self._make_converter_card(tab1, "EPUB → TXT", "epub",
+        ttk.Label(srow, text=f"transformed Desktop {APP_VERSION} · 深海女仆工坊",
+                  style="SideFaint.TLabel").pack(side=RIGHT)
+
+        # ===== 主体：侧边栏 + 页面 =====
+        body = self._tframe(self, "root")
+        body.pack(fill=BOTH, expand=True)
+
+        side = self._tframe(body, "side")
+        side.pack(side=LEFT, fill=Y)
+        side.configure(width=228)
+        side.pack_propagate(False)
+
+        # 侧栏与内容之间的 1px 分隔线（Win10 NavigationView 样式）
+        sep = tk.Frame(body, width=1, bg=pal["border"])
+        sep.pack(side=LEFT, fill=Y)
+        self._tk_recolor.append((sep, ("frame", "border")))
+
+        # logo
+        logo = self._tframe(side, "side")
+        logo.pack(fill=X, padx=22, pady=(22, 8))
+        self._tlabel(logo, "transformed", (UI_FONT, 15, "bold"),
+                     fg="fg", bg="side").pack(anchor=W)
+        self._tlabel(logo, f"深海女仆工坊 · {APP_VERSION}", (UI_FONT, 8),
+                     fg="faint", bg="side").pack(anchor=W, pady=(2, 0))
+
+        # 导航（Win10 NavigationView：选中项左侧 3px 强调条，MDL2 图标）
+        self._page = "convert"
+        self._nav_rows = {}
+        for value, glyph, text in (
+            ("convert", "\uE8AB", "格式转换"),
+            ("download", "\uE896", "视频下载"),
+            ("history", "\uE81C", "历史记录"),
+            ("log", "\uE8FD", "运行日志"),
+        ):
+            row = tk.Frame(side, bg=pal["side"], cursor="hand2")
+            row.pack(fill=X)
+            pill = tk.Frame(row, width=3, bg=pal["accent"])
+            icon = tk.Label(row, text=glyph, font=("Segoe MDL2 Assets", 10),
+                            bg=pal["side"], fg=pal["dim"])
+            label = tk.Label(row, text=text, font=(UI_FONT, 10),
+                             bg=pal["side"], fg=pal["fg"])
+            icon.pack(side=LEFT, padx=(20, 10), pady=9)
+            label.pack(side=LEFT)
+            for w in (row, icon, label):
+                w.bind("<Button-1>", lambda e, v=value: self._switch_page(v))
+                w.bind("<Enter>", lambda e, v=value: self._update_nav(hover=v))
+                w.bind("<Leave>", lambda e: self._update_nav())
+            self._nav_rows[value] = (row, pill, icon, label)
+        self._update_nav()
+
+        # 侧栏底部控制
+        foot = self._tframe(side, "side")
+        foot.pack(side=BOTTOM, fill=X, padx=14, pady=14)
+        self.theme_btn = Button(foot, text=PALETTES[self._theme]["btn_other"],
+                                    style="SideGhost.Small.TButton",
+                                    command=self._toggle_theme)
+        self.theme_btn.pack(side=LEFT)
+        Button(foot, text="输出目录", style="SideGhost.Small.TButton",
+                   command=self._set_output).pack(side=RIGHT)
+
+        # 看板娘（底部对齐，位于导航与底部控制之间）
+        if self.img_side:
+            wlbl = tk.Label(side, image=self.img_side, bg=pal["side"])
+            wlbl.pack(side=BOTTOM, fill=X)
+            self._tk_recolor.append((wlbl, ("label", "side", "side")))
+
+        # 页面容器
+        wrap = self._tframe(body, "root")
+        wrap.pack(side=LEFT, fill=BOTH, expand=True)
+        self._pages = {}
+        for name, builder in (("convert", self._page_convert),
+                              ("download", self._page_download),
+                              ("history", self._page_history),
+                              ("log", self._page_log)):
+            page = ttk.Frame(wrap, style="TFrame", padding=(22, 18, 22, 12))
+            page.grid(row=0, column=0, sticky="nsew")
+            builder(page)
+            self._pages[name] = page
+        wrap.grid_rowconfigure(0, weight=1)
+        wrap.grid_columnconfigure(0, weight=1)
+        self._switch_page("convert")
+
+    def _switch_page(self, name):
+        if name not in self._pages:
+            return
+        self._page = name
+        self._pages[name].tkraise()
+        self._update_nav()
+
+    def _update_nav(self, hover=None):
+        """按当前页 + 悬停项重刷导航行配色（Win10 NavigationView 语义）"""
+        pal = self._theme_colors()
+        for v, (row, pill, icon, label) in self._nav_rows.items():
+            sel = v == self._page
+            if sel:
+                bg = pal["nav_sel"]
+            elif v == hover:
+                bg = pal["card2"]
+            else:
+                bg = pal["side"]
+            row.config(bg=bg)
+            icon.config(bg=bg, fg=pal["accent"] if sel else pal["dim"])
+            label.config(bg=bg, fg=pal["fg"])
+            pill.config(bg=pal["accent"])
+            if sel:
+                pill.pack(side=LEFT, fill=Y)
+            else:
+                pill.pack_forget()
+
+    # ---- 页面：格式转换 ----
+    def _page_convert(self, parent):
+        grid = ttk.Frame(parent, style="TFrame")
+        grid.pack(fill=BOTH, expand=True)
+        for i in range(3):
+            grid.grid_columnconfigure(i, weight=1, uniform="conv")
+        grid.grid_rowconfigure(1, weight=1)
+
+        self._make_converter_card(grid, 0, "EPUB → TXT", "epub", "",
             "选择 EPUB 电子书，批量转换为纯文本",
             lambda: self._pick("epub", [("EPUB", "*.epub")]),
             lambda: self._convert("epub"))
-        
-        # MP4
-        self._make_converter_card(tab1, "MP4 → MP3", "mp4",
+
+        self._make_converter_card(grid, 1, "MP4 → MP3", "mp4", "",
             "提取视频中的音频轨道，保存为 MP3（支持 mp4/mkv/avi/mov/webm/flv/ts）",
             lambda: self._pick("mp4", [("视频文件", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.ts")]),
             lambda: self._convert("mp4"))
-        
-        # WebP
-        self._make_converter_card(tab1, "WebP → JPG", "webp",
-            "将 WebP 图片批量转换为 JPEG 格式（也支持 png/jpg/gif/bmp/tiff 输入）",
+
+        self._make_converter_card(grid, 2, "WebP → JPG", "webp", "",
+            "将 WebP 图片批量转换为 JPEG（也支持 png/jpg/gif/bmp/tiff 输入）",
             lambda: self._pick("webp", [("图片", "*.webp *.png *.jpg *.jpeg *.gif *.bmp *.tiff")]),
             lambda: self._convert("webp"))
-        
-        # --- Tab 2: 网络下载 ---
-        tab2 = ttk.Frame(nb, padding=15)
-        nb.add(tab2, text="🌐 网络下载")
 
-        # ---- 歌曲搜索下载 ----
-        song_box = ttk.Labelframe(tab2, text="🎵 歌曲搜索下载（MP3）", padding=12)
-        song_box.pack(fill=X, pady=(0, 10))
+        tip = self._tlabel(parent, "支持把文件直接拖进窗口，自动归类到对应卡片",
+                           (UI_FONT, 9), fg="faint", bg="root")
+        tip.pack(anchor=W, pady=(10, 0))
 
-        ttk.Label(song_box, text="输入歌手 / 歌名，自动搜索下载 MP3",
-                 font=(UI_FONT, 10), bootstyle="secondary").pack(anchor=W)
+    # ---- 页面：视频下载 ----
+    def _page_download(self, parent):
+        pal = self._theme_colors()
 
-        song_frame = ttk.Frame(song_box)
-        song_frame.pack(fill=X, pady=5)
-
+        # --- 歌曲搜索 ---
+        song_card = self._card(parent)
+        song_card.pack(fill=X, pady=(0, 12))
+        s = self._tframe(song_card, "card")
+        s.pack(fill=X, padx=16, pady=12)
+        srow = self._tframe(s, "card")
+        srow.pack(fill=X)
+        self._tlabel(srow, "歌曲搜索下载", (UI_FONT, 10, "bold"),
+                     fg="fg", bg="card").pack(side=LEFT)
+        self._tlabel(srow, "B站优先（国内直连）· 无结果自动用 YouTube 搜索兜底",
+                     (UI_FONT, 8), fg="faint", bg="card").pack(side=RIGHT)
+        srow2 = self._tframe(s, "card")
+        srow2.pack(fill=X, pady=(10, 0))
         self.song_var = tk.StringVar()
-        song_entry = ttk.Entry(song_frame, textvariable=self.song_var,
-                             font=(UI_FONT, 11))
+        song_entry = ttk.Entry(srow2, textvariable=self.song_var)
         song_entry.pack(fill=X, side=LEFT, expand=True)
         song_entry.bind("<Return>", lambda e: self._start_song_search())
+        Button(srow2, text="搜索下载", style="Accent.TButton",
+                   command=self._start_song_search).pack(side=RIGHT, padx=(10, 0))
 
-        ttk.Button(song_frame, text="🔍 搜索下载",
-                  bootstyle="warning", command=self._start_song_search).pack(side=RIGHT, padx=5)
-
-        ttk.Label(song_box, text="搜索来源: B站优先（国内直连），暂无则手机外站兜底。",
-                 font=(UI_FONT, 9), bootstyle="secondary").pack(anchor=W)
-
-        # ---- 视频链接批量下载 ----
-        url_box = ttk.Labelframe(tab2, text="🎬 视频链接下载（支持批量）", padding=12)
-        url_box.pack(fill=X, pady=(0, 8))
-
-        head = ttk.Frame(url_box)
-        head.pack(fill=X, pady=(0, 4))
-        ttk.Label(head, text="每行一个链接，支持 B站/BV号/AV号/b23短链/YouTube/X/直链",
-                 font=(UI_FONT, 9), bootstyle="secondary").pack(side=LEFT)
-        self.bili_btn = ttk.Button(head, text="🔑 B站登录", width=11,
-                                   command=self._bili_login, bootstyle="outline")
+        # --- 视频链接下载 ---
+        url_card = self._card(parent)
+        url_card.pack(fill=X, pady=(0, 12))
+        u = self._tframe(url_card, "card")
+        u.pack(fill=X, padx=16, pady=12)
+        urow = self._tframe(u, "card")
+        urow.pack(fill=X)
+        self._tlabel(urow, "视频链接下载", (UI_FONT, 10, "bold"),
+                     fg="fg", bg="card").pack(side=LEFT)
+        self.bili_btn = Button(urow, text="B站登录", style="Tonal.Small.TButton",
+                                   command=self._bili_login, width=11)
         self.bili_btn.pack(side=RIGHT)
 
-        # 多行文本输入框
-        self.url_text = tk.Text(url_box, height=4, font=(UI_FONT, 10),
-                                bg="#1a1a2e", fg="#e0e0e0", insertbackground="#e0e0e0",
-                                wrap=tk.WORD, relief=tk.FLAT, padx=8, pady=6)
-        self.url_text.pack(fill=X, pady=(0, 6))
-        # 占位符
-        self._url_placeholder = "粘贴链接到此处，每行一个...\n例如:\nhttps://www.bilibili.com/video/BV...\nyoutube.com/watch?v=..."
+        self.url_text = tk.Text(u, height=4, font=(UI_FONT, 10), wrap=tk.WORD,
+                                relief=tk.FLAT, borderwidth=0, padx=10, pady=8,
+                                highlightthickness=1,
+                                highlightbackground=pal["border"],
+                                highlightcolor=pal["accent"])
+        self.url_text.pack(fill=X, pady=(10, 4))
+        self._url_placeholder = ("粘贴链接到此处，每行一个...\n例如:\n"
+                                 "https://www.bilibili.com/video/BV...\n"
+                                 "youtube.com/watch?v=...")
         self._set_url_placeholder(True)
         self.url_text.bind("<FocusIn>", self._on_url_text_focus_in)
         self.url_text.bind("<FocusOut>", self._on_url_text_focus_out)
+        self._tk_recolor.append((self.url_text, ("input_text",)))
+        self._tlabel(u, "每行一个链接 · 支持 B站/BV号/AV号/b23短链/YouTube/X/直链 · 可拖入窗口",
+                     (UI_FONT, 8), fg="faint", bg="card").pack(anchor=W)
 
-        # 格式选择 + 按钮行
-        btn_row = ttk.Frame(url_box)
-        btn_row.pack(fill=X, pady=(0, 2))
-
+        brow = self._tframe(u, "card")
+        brow.pack(fill=X, pady=(10, 0))
         saved_type = self.settings.get("dl_type")
         self.dl_type = tk.StringVar(value=saved_type if saved_type in ("mp4", "mp3") else "mp4")
         # 任何方式改变格式都持久化（点击/键盘/程序赋值）
         self.dl_type.trace_add("write", lambda *_: self.settings.set("dl_type", self.dl_type.get()))
-        ttk.Radiobutton(btn_row, text="🎬 MP4", variable=self.dl_type,
-                       value="mp4", bootstyle="success").pack(side=LEFT, padx=2)
-        ttk.Radiobutton(btn_row, text="🎵 MP3", variable=self.dl_type,
-                       value="mp3", bootstyle="warning").pack(side=LEFT, padx=2)
-        ttk.Button(btn_row, text="📋 粘贴", bootstyle="outline",
-                  command=self._paste_from_clipboard).pack(side=LEFT, padx=(0, 8))
+        Radiobutton(brow, text="MP4 视频", variable=self.dl_type, value="mp4",
+                        style="Chip.TRadiobutton").pack(side=LEFT)
+        Radiobutton(brow, text="MP3 音频", variable=self.dl_type, value="mp3",
+                        style="Chip.TRadiobutton").pack(side=LEFT, padx=(6, 12))
+        Button(brow, text="粘贴", style="Ghost.Small.TButton",
+                   command=self._paste_from_clipboard).pack(side=LEFT)
 
-        ttk.Button(btn_row, text="➕ 添加到队列", bootstyle="info",
-                  command=self._start_dl).pack(side=RIGHT, padx=3)
-        ttk.Button(btn_row, text="▶ 开始下载", bootstyle="success",
-                  command=self._start_queue).pack(side=RIGHT, padx=3)
-        ttk.Button(btn_row, text="📂 打开文件夹", bootstyle="outline",
-                  command=self._open_output_folder).pack(side=RIGHT, padx=3)
+        Button(brow, text="打开文件夹", style="Ghost.Small.TButton",
+                   command=self._open_output_folder).pack(side=RIGHT, padx=(8, 0))
+        Button(brow, text="添加到队列", style="Tonal.Small.TButton",
+                   command=self._start_dl).pack(side=RIGHT, padx=(8, 0))
+        Button(brow, text="开始下载", style="Accent.Small.TButton",
+                   command=self._start_queue).pack(side=RIGHT)
 
-        # ---- 队列区 ----
-        queue_box = ttk.Labelframe(tab2, text="📋 下载队列", padding=8)
-        queue_box.pack(fill=BOTH, expand=True, pady=(0, 8))
+        # --- 下载队列 ---
+        q_card = self._card(parent)
+        q_card.pack(fill=BOTH, expand=True, pady=(0, 12))
+        q = self._tframe(q_card, "card")
+        q.pack(fill=BOTH, expand=True, padx=16, pady=12)
+        qrow = self._tframe(q, "card")
+        qrow.pack(fill=X)
+        self._tlabel(qrow, "下载队列", (UI_FONT, 10, "bold"),
+                     fg="fg", bg="card").pack(side=LEFT)
+        self._tlabel(qrow, "双击失败项查看错误 · 双击完成项打开文件 · Delete 删除",
+                     (UI_FONT, 8), fg="faint", bg="card").pack(side=RIGHT, padx=8)
 
-        # Treeview
         q_cols = ("idx", "status", "name", "progress")
-        self.queue_tree = ttk.Treeview(queue_box, columns=q_cols, show="headings",
-                                       height=8, bootstyle="info", selectmode="extended")
+        self.queue_tree = ttk.Treeview(q, columns=q_cols, show="headings",
+                                       height=5, selectmode="extended")
         self.queue_tree.heading("idx", text="#")
         self.queue_tree.heading("status", text="状态")
         self.queue_tree.heading("name", text="文件名 / URL")
         self.queue_tree.heading("progress", text="进度")
         self.queue_tree.column("idx", width=40, anchor=CENTER, stretch=False)
-        self.queue_tree.column("status", width=90, anchor=CENTER, stretch=False)
+        self.queue_tree.column("status", width=96, anchor=CENTER, stretch=False)
         self.queue_tree.column("name", width=320)
         self.queue_tree.column("progress", width=90, anchor=CENTER, stretch=False)
-        self.queue_tree.tag_configure("waiting", foreground="#8899aa")
-        self.queue_tree.tag_configure("downloading", foreground="#00ccff")
-        self.queue_tree.tag_configure("done", foreground="#44cc44")
-        self.queue_tree.tag_configure("failed", foreground="#ff5555")
-        self.queue_tree.tag_configure("retrying", foreground="#ffaa00")
-        q_scroll = ttk.Scrollbar(queue_box, command=self.queue_tree.yview)
+        q_scroll = ttk.Scrollbar(q, command=self.queue_tree.yview)
         self.queue_tree.configure(yscrollcommand=q_scroll.set)
-        self.queue_tree.pack(side=LEFT, fill=BOTH, expand=True)
-        q_scroll.pack(side=RIGHT, fill=Y)
+        self.queue_tree.pack(side=LEFT, fill=BOTH, expand=True, pady=(10, 0))
+        q_scroll.pack(side=RIGHT, fill=Y, pady=(10, 0))
         # 键盘 Delete 删除；双击失败行看错误详情，双击完成行直接打开文件
         self.queue_tree.bind("<Delete>", lambda e: self._queue_delete_selected())
         self.queue_tree.bind("<Double-1>", self._on_queue_double_click)
         # 右键菜单
         self._queue_menu = tk.Menu(self, tearoff=0)
-        self._queue_menu.add_command(label="▶ 开始下载", command=self._start_queue)
+        self._queue_menu.add_command(label="开始下载", command=self._start_queue)
         self._queue_menu.add_separator()
-        self._queue_menu.add_command(label="↻ 重试选中", command=self._queue_retry_selected)
-        self._queue_menu.add_command(label="⬆ 上移", command=lambda: self._queue_move(-1))
-        self._queue_menu.add_command(label="⬇ 下移", command=lambda: self._queue_move(1))
+        self._queue_menu.add_command(label="重试选中", command=self._queue_retry_selected)
+        self._queue_menu.add_command(label="上移", command=lambda: self._queue_move(-1))
+        self._queue_menu.add_command(label="下移", command=lambda: self._queue_move(1))
         self._queue_menu.add_separator()
-        self._queue_menu.add_command(label="🗑 删除选中", command=self._queue_delete_selected)
+        self._queue_menu.add_command(label="删除选中", command=self._queue_delete_selected)
         self.queue_tree.bind("<Button-3>", self._show_queue_menu)  # 右键
+        self._tk_recolor.append((self._queue_menu, ("menu",)))
 
-        # 队列操作按钮行
-        q_btns = ttk.Frame(queue_box)
-        q_btns.pack(fill=X, pady=(6, 0))
-        ttk.Button(q_btns, text="⬆ 上移", bootstyle="outline",
-                  command=lambda: self._queue_move(-1)).pack(side=LEFT, padx=2)
-        ttk.Button(q_btns, text="⬇ 下移", bootstyle="outline",
-                  command=lambda: self._queue_move(1)).pack(side=LEFT, padx=2)
-        ttk.Button(q_btns, text="↻ 重试选中", bootstyle="warning-outline",
-                  command=self._queue_retry_selected).pack(side=LEFT, padx=2)
-        ttk.Button(q_btns, text="🗑 删除选中", bootstyle="danger-outline",
-                  command=self._queue_delete_selected).pack(side=LEFT, padx=2)
-        ttk.Button(q_btns, text="清空队列", bootstyle="danger",
-                  command=self._queue_clear).pack(side=RIGHT, padx=2)
-        ttk.Label(q_btns, text="并发", font=(UI_FONT, 9),
-                 bootstyle="secondary").pack(side=RIGHT, padx=(8, 2))
+        q_btns = self._tframe(q, "card")
+        q_btns.pack(fill=X, pady=(8, 0))
+        Button(q_btns, text="上移", style="Ghost.Small.TButton",
+                   command=lambda: self._queue_move(-1)).pack(side=LEFT, padx=(0, 4))
+        Button(q_btns, text="下移", style="Ghost.Small.TButton",
+                   command=lambda: self._queue_move(1)).pack(side=LEFT, padx=4)
+        Button(q_btns, text="重试选中", style="Ghost.Small.TButton",
+                   command=self._queue_retry_selected).pack(side=LEFT, padx=4)
+        Button(q_btns, text="删除选中", style="Ghost.Small.TButton",
+                   command=self._queue_delete_selected).pack(side=LEFT, padx=4)
+        ttk.Label(q_btns, text="并发", style="CardDim.TLabel").pack(side=RIGHT, padx=(10, 4))
         self.parallel_var = tk.StringVar(value=str(self.max_parallel))
         parallel_box = ttk.Combobox(q_btns, textvariable=self.parallel_var,
                                     values=("1", "2", "3"), width=3, state="readonly")
         parallel_box.pack(side=RIGHT)
         parallel_box.bind("<<ComboboxSelected>>", self._on_parallel_change)
+        Button(q_btns, text="清空队列", style="Danger.Small.TButton",
+                   command=self._queue_clear).pack(side=RIGHT, padx=(16, 10))
 
-        # ---- 进度区 ----
-        prog_box = ttk.Labelframe(tab2, text="📊 下载进度", padding=8)
-        prog_box.pack(fill=X)
+        # --- 进度区 ---
+        p_card = self._card(parent)
+        p_card.pack(fill=X)
+        p = self._tframe(p_card, "card")
+        p.pack(fill=X, padx=16, pady=12)
+        prow = self._tframe(p, "card")
+        prow.pack(fill=X)
+        self.dl_total_label = ttk.Label(prow, text="总进度: 0/0", style="CardDim.TLabel")
+        self.dl_total_label.pack(side=LEFT, padx=(0, 12))
+        self.dl_total_prog = Progressbar(prow, mode="determinate",
+                                             style="Ok.Horizontal.TProgressbar")
+        self.dl_total_prog.pack(side=LEFT, fill=X, expand=True)
+        prow2 = self._tframe(p, "card")
+        prow2.pack(fill=X, pady=(8, 0))
+        self.dl_stat = ttk.Label(prow2, text="", style="CardDim.TLabel")
+        self.dl_stat.pack(side=LEFT, padx=(0, 12))
+        self.dl_prog = Progressbar(prow2, mode="determinate",
+                                       style="Horizontal.TProgressbar")
+        self.dl_prog.pack(side=LEFT, fill=X, expand=True)
 
-        self.dl_total_label = ttk.Label(prog_box, text="总进度: 0/0",
-                                        font=(UI_FONT, 9))
-        self.dl_total_label.pack(anchor=W)
-        self.dl_total_prog = ttk.Progressbar(prog_box, mode="determinate",
-                                             bootstyle="success-striped")
-        self.dl_total_prog.pack(fill=X, pady=2)
+    # ---- 页面：历史记录 ----
+    def _page_history(self, parent):
+        card = self._card(parent)
+        card.pack(fill=BOTH, expand=True)
+        w = self._tframe(card, "card")
+        w.pack(fill=BOTH, expand=True, padx=16, pady=12)
 
-        ttk.Label(prog_box, text="当前:", font=(UI_FONT, 9)).pack(anchor=W, pady=(4, 0))
-        self.dl_prog = ttk.Progressbar(prog_box, mode="determinate",
-                                       bootstyle="info-striped")
-        self.dl_prog.pack(fill=X, pady=2)
-        self.dl_stat = ttk.Label(prog_box, text="", font=(UI_FONT, 9))
-        self.dl_stat.pack(anchor=W)
+        hrow = self._tframe(w, "card")
+        hrow.pack(fill=X, pady=(0, 10))
+        self._tlabel(hrow, "历史记录", (UI_FONT, 10, "bold"),
+                     fg="fg", bg="card").pack(side=LEFT)
+        self.filter_var = tk.StringVar(value="全部")
+        for tag in ["全部", "EPUB", "MP4", "WebP", "下载"]:
+            Radiobutton(hrow, text=tag, variable=self.filter_var, value=tag,
+                            style="Chip.TRadiobutton",
+                            command=self.history_tree_refresh).pack(side=LEFT, padx=(10, 0))
 
-        # 支持列表
-        info = ttk.Frame(tab2, padding=(6, 6, 6, 0))
-        info.pack(fill=X, pady=(4, 0))
-        ttk.Label(info, text="✅ 支持的平台",
-                 font=(UI_FONT, 11, "bold")).pack(anchor=W)
-        for line in ["• Bilibili — BV/AV号或完整链接",
-                     "• YouTube — youtube.com / youtu.be",
-                     "• Twitter/X — twitter.com / x.com",
-                     "• 通用直链 — 任意媒体文件直链"]:
-            ttk.Label(info, text=line).pack(anchor=W)
-        
-        # --- Tab 3: 日志 ---
-        tab3 = ttk.Frame(nb, padding=10)
-        nb.add(tab3, text="📋 运行日志")
-        
-        log_btn = ttk.Frame(tab3)
-        log_btn.pack(fill=X)
-        ttk.Button(log_btn, text="刷新", bootstyle="info-outline",
-                  command=self._log_refresh).pack(side=LEFT, padx=2)
-        ttk.Button(log_btn, text="清空", bootstyle="danger-outline",
-                  command=self._log_clear).pack(side=LEFT, padx=2)
-        
-        self.log_text = scrolledtext.ScrolledText(tab3, height=15,
-            font=("Consolas", 9), bg="#1a1a2e", fg="#e0e0e0")
-        self.log_text.pack(fill=BOTH, expand=True, pady=5)
+        cols = ("time", "file", "type", "status")
+        self.tree = ttk.Treeview(w, columns=cols, show="headings",
+                                 selectmode="extended")
+        self.tree.heading("time", text="时间")
+        self.tree.heading("file", text="文件")
+        self.tree.heading("type", text="类型")
+        self.tree.heading("status", text="状态")
+        self.tree.column("time", width=100, anchor=CENTER, stretch=False)
+        self.tree.column("file", width=200)
+        self.tree.column("type", width=80, anchor=CENTER, stretch=False)
+        self.tree.column("status", width=50, anchor=CENTER, stretch=False)
+        scroll = ttk.Scrollbar(w, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll.pack(side=RIGHT, fill=Y)
+        self.tree.bind("<Control-a>", self._history_select_all_visible)
+        self.tree.bind("<Control-A>", self._history_select_all_visible)
+        self.tree.bind("<Delete>", lambda event: self._history_delete_selected())
+        self.tree.bind("<Double-1>", self._on_history_double_click)
 
+        btm = self._tframe(w, "card")
+        btm.pack(fill=X, pady=(10, 0))
+        Button(btm, text="全选当前", style="Ghost.Small.TButton",
+                   command=self._history_select_all_visible).pack(side=LEFT)
+        Button(btm, text="清空全部", style="Danger.Small.TButton",
+                   command=self._history_clear).pack(side=RIGHT)
+        Button(btm, text="删除选中", style="Tonal.Small.TButton",
+                   command=self._history_delete_selected).pack(side=RIGHT, padx=(0, 10))
+
+        self.history_tree_refresh()
+
+    # ---- 页面：运行日志 ----
+    def _page_log(self, parent):
+        pal = self._theme_colors()
+        card = self._card(parent)
+        card.pack(fill=BOTH, expand=True)
+        w = self._tframe(card, "card")
+        w.pack(fill=BOTH, expand=True, padx=16, pady=12)
+
+        lrow = self._tframe(w, "card")
+        lrow.pack(fill=X, pady=(0, 10))
+        self._tlabel(lrow, "运行日志", (UI_FONT, 10, "bold"),
+                     fg="fg", bg="card").pack(side=LEFT)
+        Button(lrow, text="清空", style="Danger.Small.TButton",
+                   command=self._log_clear).pack(side=RIGHT)
+        Button(lrow, text="刷新", style="Ghost.Small.TButton",
+                   command=self._log_refresh).pack(side=RIGHT, padx=(0, 8))
+
+        box = self._tframe(w, "input")
+        box.configure(highlightthickness=1, highlightbackground=pal["border"],
+                      highlightcolor=pal["accent"])
+        self._tk_recolor.append((box, ("frameb", "input")))
+        box.pack(fill=BOTH, expand=True)
+        self.log_text = tk.Text(box, height=15, font=("Consolas", 9), wrap=tk.WORD,
+                                relief=tk.FLAT, borderwidth=0, padx=10, pady=8)
+        sb = ttk.Scrollbar(box, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
+        sb.pack(side=RIGHT, fill=Y)
+        self.log_text.pack(side=LEFT, fill=BOTH, expand=True)
+        self._log_refresh()
+    
     def _on_parallel_change(self, event=None):
         """调整并行下载并发数（立即生效：增加时补齐 worker）"""
         try:
@@ -520,92 +671,44 @@ class App(ttk.Window):
         self._ensure_workers()
         self.status.config(text=f"下载并发已设为 {self.max_parallel}")
 
-    def _make_converter_card(self, parent, title, key, desc, pick_fn, conv_fn):
-        """创建转换卡片（带标题的分组框）"""
-        icons = {"epub": "📖", "mp4": "🎬", "webp": "🖼️"}
+    def _make_converter_card(self, parent, col, title, key, icon, desc, pick_fn, conv_fn):
+        """创建转换卡片（三列网格中的一列）"""
+        card = self._card(parent)
+        card.grid(row=0, column=col, sticky="new", padx=5, pady=2)
+        inner = self._tframe(card, "card")
+        inner.pack(fill=BOTH, expand=True, padx=18, pady=16)
 
-        card = ttk.Labelframe(parent, text=f" {icons.get(key, '📁')} {title} ",
-                              padding=(12, 8), bootstyle="primary")
-        card.pack(fill=X, pady=7)
-
-        ttk.Label(card, text=desc, font=(UI_FONT, 9),
-                 bootstyle="secondary").pack(anchor=W)
+        pal = self._theme_colors()
+        head = self._tframe(inner, "card")
+        head.pack(fill=X)
+        tk.Label(head, text=icon, font=("Segoe MDL2 Assets", 11),
+                 bg=pal["card"], fg=pal["accent"]).pack(side=LEFT, padx=(0, 8))
+        self._tlabel(head, title, (UI_FONT, 10, "bold"),
+                     fg="fg", bg="card").pack(side=LEFT)
+        self._tlabel(inner, desc, (UI_FONT, 9), fg="dim", bg="card",
+                     wraplength=268, justify=LEFT).pack(anchor=W, pady=(6, 12))
 
         self.convert_cards[key] = {
             "files": [],
-            "label": ttk.Label(card, text="未选择文件", bootstyle="secondary"),
-            "progress": ttk.Progressbar(card, mode="determinate",
-                                        bootstyle="success-striped"),
-            "status": ttk.Label(card, text="", font=(UI_FONT, 9)),
+            "label": ttk.Label(inner, text="未选择文件", style="CardDim.TLabel"),
+            "progress": Progressbar(inner, mode="determinate",
+                                        style="Horizontal.TProgressbar"),
+            "status": ttk.Label(inner, text="", style="CardDim.TLabel"),
             "pick_fn": pick_fn,
             "conv_fn": conv_fn,
         }
 
-        btn_frame = ttk.Frame(card)
-        btn_frame.pack(fill=X, pady=6)
+        btn_frame = self._tframe(inner, "card")
+        btn_frame.pack(fill=X, pady=(0, 12))
 
-        ttk.Button(btn_frame, text="📂 选择文件",
-                  command=pick_fn, bootstyle="outline").pack(side=LEFT, padx=(0, 6))
-        ttk.Button(btn_frame, text="▶ 开始转换",
-                  command=conv_fn, bootstyle="success").pack(side=LEFT)
-        self.convert_cards[key]["label"].pack(side=RIGHT, padx=2)
+        Button(btn_frame, text="选择文件", style="Ghost.Small.TButton",
+                   command=pick_fn).pack(side=LEFT)
+        Button(btn_frame, text="开始转换", style="Accent.Small.TButton",
+                   command=conv_fn).pack(side=LEFT, padx=(8, 0))
+        self.convert_cards[key]["label"].pack(side=RIGHT)
 
-        self.convert_cards[key]["progress"].pack(fill=X, pady=(2, 3))
+        self.convert_cards[key]["progress"].pack(fill=X, pady=(0, 6))
         self.convert_cards[key]["status"].pack(anchor=W)
-    
-    # ---- 右侧历史 ----
-    def _build_right(self, parent):
-        ttk.Label(parent, text="📜 转换记录", font=(UI_FONT, 14, "bold"),
-                 bootstyle="inverse-secondary").pack(fill=X, pady=(2, 5))
-        
-        # 筛选
-        filt = ttk.Frame(parent)
-        filt.pack(fill=X, pady=(0, 4))
-        self.filter_var = tk.StringVar(value="全部")
-        for tag in ["全部", "EPUB", "MP4", "WebP", "下载"]:
-            ttk.Radiobutton(filt, text=tag, variable=self.filter_var,
-                          value=tag, command=self.history_tree_refresh,
-                          bootstyle="secondary").pack(side=LEFT, padx=2)
-        
-        # 树状表格（支持 Ctrl/Shift 多选）
-        cols = ("time", "file", "type", "status")
-        self.tree = ttk.Treeview(parent, columns=cols, show="headings",
-                                 height=18, bootstyle="info",
-                                 selectmode="extended")
-        self.tree.heading("time", text="时间")
-        self.tree.heading("file", text="文件")
-        self.tree.heading("type", text="类型")
-        self.tree.heading("status", text="状态")
-        self.tree.column("time", width=90, anchor=CENTER)
-        self.tree.column("file", width=160)
-        self.tree.column("type", width=70, anchor=CENTER)
-        self.tree.column("status", width=40, anchor=CENTER)
-        
-        # 斑马纹：隔行背景色
-        self.tree.tag_configure("odd", background="#223140")
-        self.tree.tag_configure("even", background="#2b3e50")
-        
-        scroll = ttk.Scrollbar(parent, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scroll.set)
-        
-        self.tree.pack(side=LEFT, fill=BOTH, expand=True)
-        scroll.pack(side=RIGHT, fill=Y)
-        self.tree.bind("<Control-a>", self._history_select_all_visible)
-        self.tree.bind("<Control-A>", self._history_select_all_visible)
-        self.tree.bind("<Delete>", lambda event: self._history_delete_selected())
-        self.tree.bind("<Double-1>", self._on_history_double_click)
-        
-        # 底部按钮
-        btm = ttk.Frame(parent)
-        btm.pack(fill=X, pady=5)
-        ttk.Button(btm, text="全选当前", bootstyle="secondary-outline",
-                   command=self._history_select_all_visible).pack(side=LEFT, padx=2)
-        ttk.Button(btm, text="🗑 删除选中", bootstyle="warning-outline",
-                  command=self._history_delete_selected).pack(side=RIGHT, padx=2)
-        ttk.Button(btm, text="清空全部", bootstyle="danger-outline",
-                  command=self._history_clear).pack(side=RIGHT, padx=2)
-        
-        self.history_tree_refresh()
     
     # ---- 功能方法 ----
     def _set_output(self):
@@ -618,33 +721,55 @@ class App(ttk.Window):
 
     # ---- 主题 ----
     def _theme_colors(self):
-        return THEMES.get(self._theme, THEMES["superhero"])
+        return PALETTES.get(self._theme, PALETTES["deep"])
 
     def _apply_theme_colors(self):
-        """主题切换后同步自绘控件（文本框/斑马纹/队列状态色/按钮文字）的颜色"""
-        c = self._theme_colors()
+        """主题切换后：重刷全部 ttk 样式并重配色自绘 tk 控件"""
+        pal = self._theme_colors()
+        ui_style.apply_palette(self.style, self, pal)
+        for entry in getattr(self, "_tk_recolor", []):
+            w, spec = entry
+            try:
+                if spec[0] == "frame":
+                    w.config(bg=pal[spec[1]])
+                elif spec[0] == "frameb":
+                    w.config(bg=pal[spec[1]],
+                             highlightbackground=pal["border"],
+                             highlightcolor=pal["accent"])
+                elif spec[0] == "label":
+                    w.config(bg=pal[spec[2]], fg=pal[spec[1]])
+                elif spec[0] == "menu":
+                    w.config(bg=pal["card"], fg=pal["fg"], borderwidth=0,
+                             activebackground=pal["card2"],
+                             activeforeground=pal["fg"])
+            except tk.TclError:
+                pass
         for widget in (self.url_text, self.log_text):
-            widget.config(bg=c["bg"], fg=c["fg"], insertbackground=c["fg"])
-        self.tree.tag_configure("odd", background=c["zebra_odd"])
-        self.tree.tag_configure("even", background=c["zebra_even"])
-        for tag, color in c["q_tags"].items():
+            widget.config(bg=pal["input"], fg=pal["fg"], insertbackground=pal["fg"],
+                          highlightbackground=pal["border"],
+                          highlightcolor=pal["accent"])
+        self.tree.tag_configure("odd", background=pal["zebra2"])
+        self.tree.tag_configure("even", background=pal["zebra1"])
+        for tag, color in pal["q_tags"].items():
             self.queue_tree.tag_configure(tag, foreground=color)
         if getattr(self, "_url_placeholder_active", False):
-            self.url_text.config(fg=c["ph"])
-        other = "flatly" if self._theme == "superhero" else "superhero"
-        self.theme_btn.config(text=THEMES[other]["btn"])
+            self.url_text.config(fg=pal["ph"])
+        self.theme_btn.config(text=pal["btn_other"])
+        ui_style.style_titlebar(self, dark=pal["dark"])
+        if getattr(self, "_nav_rows", None):
+            self._update_nav()
 
     def _toggle_theme(self):
-        new = "flatly" if self._theme == "superhero" else "superhero"
+        new = "day" if self._theme == "deep" else "deep"
         try:
-            self.style.theme_use(new)
+            self.style.theme_use(BASE_THEMES[new])
         except Exception as e:
             Logger.log(f"切换主题失败: {e}")
             return
         self._theme = new
         self.settings.set("theme", new)
         self._apply_theme_colors()
-        self.status.config(text=f"主题已切换: {new}")
+        self.status.config(text=f"主题已切换: {'浅色' if new == 'day' else '深海'}")
 
     # ---- 剪贴板 ----
     def _paste_from_clipboard(self):
@@ -749,11 +874,10 @@ class App(ttk.Window):
             self.status.config(text="已从拖拽导入链接")
 
     def _show_tab(self, index):
-        """切换左侧功能面板到指定标签页"""
-        try:
-            self.nb.select(index)
-        except Exception:
-            pass
+        """切换页面；兼容旧索引：0=格式转换 1=视频下载"""
+        name = {0: "convert", 1: "download"}.get(index, index)
+        if name in self._pages:
+            self._switch_page(name)
 
     # ---- B 站扫码登录 ----
     def _update_bili_btn(self):
@@ -761,7 +885,7 @@ class App(ttk.Window):
             uid = bili_user_id()
             self.bili_btn.config(text=f"🚪 退出{uid}" if uid else "🚪 退出登录")
         else:
-            self.bili_btn.config(text="🔑 B站登录")
+            self.bili_btn.config(text="B站登录")
 
     def _bili_login(self):
         """已登录 → 询问退出；未登录 → 后台获取二维码并弹出扫码窗口"""
@@ -796,16 +920,20 @@ class App(ttk.Window):
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
+        dlg.configure(bg=self._theme_colors()["root"])
 
         ttk.Label(dlg, text="请用 B 站 APP 扫描二维码登录",
-                  font=(UI_FONT, 11, "bold")).pack(padx=16, pady=(14, 6))
+                  font=(UI_FONT, 10, "bold"),
+                  bg=self._theme_colors()["root"],
+                  fg=self._theme_colors()["fg"]).pack(padx=16, pady=(14, 6))
         photo = ImageTk.PhotoImage(qr_img)
         self._qr_photo = photo  # 持引用，防止被 GC 后图片消失
-        ttk.Label(dlg, image=photo).pack(padx=16, pady=4)
-        status_lbl = ttk.Label(dlg, text="等待扫码…", bootstyle="secondary")
+        ttk.Label(dlg, image=photo,
+                  bg=self._theme_colors()["root"]).pack(padx=16, pady=4)
+        status_lbl = ttk.Label(dlg, text="等待扫码…", style="Dim.TLabel")
         status_lbl.pack(padx=16, pady=(2, 4))
         ttk.Label(dlg, text="登录凭据仅保存在本机；登录后 B 站视频可下载更高清晰度",
-                  font=(UI_FONT, 8), bootstyle="secondary").pack(padx=16, pady=(0, 8))
+                  font=(UI_FONT, 8), style="Faint.TLabel").pack(padx=16, pady=(0, 8))
 
         stop_event = threading.Event()
 
@@ -816,7 +944,8 @@ class App(ttk.Window):
             except Exception:
                 pass
 
-        ttk.Button(dlg, text="取消", bootstyle="secondary", command=close).pack(pady=(0, 12))
+        Button(dlg, text="取消", style="Ghost.TButton",
+                   command=close).pack(pady=(0, 12))
         dlg.protocol("WM_DELETE_WINDOW", close)
 
         def ui_status(msg):
@@ -1370,6 +1499,35 @@ class App(ttk.Window):
                 self._dl_pcts[uid] = 0.0
 
         try:
+            self._dl_with_ytdlp(item, ready_url, is_mp3, is_foreign,
+                                bili_headers, uid, cb, progress_hook)
+        finally:
+            self._dl_pcts.pop(uid, None)
+            self._run_on_ui("download-finished", lambda: (
+                self.dl_prog.stop(),
+                self.dl_prog.config(mode="determinate"),
+                self._queue_refresh_tree(),
+                self.history_tree_refresh(),
+                self._log_refresh()))
+    
+    # 瞬时网络错误特征：代理出口（如 WARP）轮换时连接会被掐断/重置，
+    # 这类失败等待几秒重试一次通常就能成功
+    _TRANSIENT_NET_RE = re.compile(
+        r"ProxyError|RemoteDisconnected|ConnectionReset|Connection aborted|"
+        r"timed out|TimeoutError|Temporary failure|WinError 10054|WinError 10060",
+        re.IGNORECASE)
+
+    @classmethod
+    def _is_transient_net_error(cls, exc):
+        return bool(cls._TRANSIENT_NET_RE.search(str(exc)))
+
+    def _dl_with_ytdlp(self, item, ready_url, is_mp3, is_foreign, bili_headers,
+                       uid, cb, progress_hook, _retried=False):
+        """yt-dlp 通用下载（B站直连失败后的回退路径，也服务 YouTube/X/直链）。
+
+        遇到瞬时网络错误自动重试一次：队列里显示为"重试中"。
+        """
+        try:
             opts = build_download_options(
                 ready_url,
                 is_mp3=is_mp3,
@@ -1404,6 +1562,16 @@ class App(ttk.Window):
             Logger.log(f"✅ 下载成功: {name}")
             self._run_on_ui("download-status", lambda n=name: self.status.config(text=f"下载成功: {n}"))
         except Exception as e:
+            if not _retried and self._is_transient_net_error(e):
+                Logger.log(f"网络抖动(代理出口可能已切换)，3 秒后自动重试: {e}")
+                item["status"] = "retrying"
+                item["progress"] = ""
+                self._dl_pcts[uid] = 0.0
+                self._run_on_ui("queue-refresh", self._queue_refresh_tree)
+                time.sleep(3)
+                self._dl_with_ytdlp(item, ready_url, is_mp3, is_foreign, bili_headers,
+                                    uid, cb, progress_hook, _retried=True)
+                return
             Logger.log(f"❌ 下载失败: {e}")
             err = str(e)
             item["status"] = "failed"
@@ -1424,15 +1592,7 @@ class App(ttk.Window):
                 self._show_toast_ui("下载失败", err[:300] + hint, "error"),
                 self.dl_prog.stop(),
                 self.dl_prog.config(value=0, mode="determinate")))
-        finally:
-            self._dl_pcts.pop(uid, None)
-            self._run_on_ui("download-finished", lambda: (
-                self.dl_prog.stop(),
-                self.dl_prog.config(mode="determinate"),
-                self._queue_refresh_tree(),
-                self.history_tree_refresh(),
-                self._log_refresh()))
-    
+
     def _fmt_speed(self, speed):
         """格式化下载速度"""
         if not speed:
@@ -1486,11 +1646,14 @@ class App(ttk.Window):
         dlg.resizable(False, False)
         dlg.transient(self)
         dlg.grab_set()
+        dlg.configure(bg=self._theme_colors()["root"])
 
         ttk.Label(dlg, text=f"🔍 搜索: {query}  （共 {len(results)} 条结果）",
-                  font=(UI_FONT, 11, "bold"), bootstyle="info").pack(padx=12, pady=(12, 6), anchor=W)
+                  font=(UI_FONT, 10, "bold"),
+                  bg=self._theme_colors()["root"],
+                  fg=self._theme_colors()["fg"]).pack(padx=12, pady=(12, 6), anchor=W)
         ttk.Label(dlg, text="点击选中后自动开始下载 MP3",
-                  font=(UI_FONT, 9), bootstyle="secondary").pack(padx=12, anchor=W)
+                  font=(UI_FONT, 9), style="Dim.TLabel").pack(padx=12, anchor=W)
 
         # 结果列表
         tree = ttk.Treeview(dlg, columns=("idx", "title", "author", "duration"),
@@ -1537,9 +1700,9 @@ class App(ttk.Window):
 
         btn_frame = ttk.Frame(dlg)
         btn_frame.pack(fill=X, padx=12, pady=8)
-        ttk.Button(btn_frame, text="▶ 下载选中", bootstyle="success",
+        Button(btn_frame, text="▶ 下载选中", style="Accent.TButton",
                    command=on_select).pack(side=LEFT, padx=4)
-        ttk.Button(btn_frame, text="取消", bootstyle="secondary",
+        Button(btn_frame, text="取消", style="Ghost.TButton",
                    command=dlg.destroy).pack(side=RIGHT, padx=4)
 
     # ========== 队列管理方法 ==========

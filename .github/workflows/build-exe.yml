@@ -35,7 +35,7 @@ jobs:
     - name: Build EXE
       shell: cmd
       run: |
-        pyinstaller --onefile --windowed --name "transformed" --hidden-import ttkbootstrap --hidden-import PIL._tkinter_finder --hidden-import ebooklib --hidden-import yt_dlp --hidden-import mutagen --exclude-module PIL.AvifImagePlugin --collect-all ttkbootstrap main.py
+        pyinstaller --onefile --windowed --name "transformed" --add-data "assets;assets" --hidden-import ttkbootstrap --hidden-import PIL._tkinter_finder --hidden-import ebooklib --hidden-import yt_dlp --hidden-import mutagen --exclude-module PIL.AvifImagePlugin --collect-all ttkbootstrap main.py
 
     - name: Verify packaged EXE
       shell: pwsh

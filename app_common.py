@@ -5,27 +5,58 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-APP_VERSION = "v1.6.2"
-UI_FONT = "Microsoft YaHei UI"
+APP_VERSION = "v1.7.0"
+UI_FONT = "Segoe UI"  # 缺字形的中文由系统字体回退，观感与 Win10 原生一致
 
-# 深浅色主题对应的自绘控件颜色（ttk 部件由主题自动适配）。
-# btn = 切换按钮的文字（描述点击后将切到的目标主题）
-THEMES = {
-    "superhero": {
-        "btn": "🌙 深色",
-        "bg": "#1a1a2e", "fg": "#e0e0e0", "ph": "#667788",
-        "zebra_odd": "#223140", "zebra_even": "#2b3e50",
-        "q_tags": {"waiting": "#8899aa", "downloading": "#00ccff",
-                   "done": "#44cc44", "failed": "#ff5555", "retrying": "#ffaa00"},
+# 深浅色两套完整调色板（ui_style.apply_palette 消费）。
+# 风格基准：Windows 10 设置（Fluent）——中性灰阶 + 系统强调蓝。
+# dark = 是否深色（用于标题栏深色模式）；btn_other = 切换按钮显示的目标主题文字。
+# 兼容旧设置值：superhero/flatly 经 THEME_ALIASES 映射。
+PALETTES = {
+    "deep": {
+        "dark": True, "btn_other": "浅色模式",
+        "root": "#1f1f1f", "side": "#1f1f1f", "nav_sel": "#333333",
+        "card": "#2b2b2b", "card2": "#333333", "input": "#2b2b2b",
+        "tonal": "#333333", "tonal_hover": "#3d3d3d",
+        "border": "#383838",
+        "btn_border": "#4a4a4a", "input_border": "#5a5a5a",
+        "fg": "#ffffff", "dim": "#a6a6a6", "faint": "#767676", "ph": "#6b6b6b",
+        "accent": "#0078d7", "accent_hover": "#1a86d9", "accent_down": "#005a9e",
+        "accent_fg": "#ffffff",
+        "ok": "#6ccb5f", "warn": "#ffb900", "danger": "#ff6b6b", "info": "#4cc2ff",
+        "danger_bg": "#3c1a1e", "danger_bg_hover": "#4a2025",
+        "sel": "#0078d7", "sel_fg": "#ffffff",
+        "zebra1": "#2b2b2b", "zebra2": "#303030",
+        "q_tags": {"waiting": "#a6a6a6", "downloading": "#4cc2ff",
+                   "done": "#6ccb5f", "failed": "#ff6b6b", "retrying": "#ffb900"},
     },
-    "flatly": {
-        "btn": "☀ 浅色",
-        "bg": "#ffffff", "fg": "#212529", "ph": "#95a5a6",
-        "zebra_odd": "#eef2f5", "zebra_even": "#ffffff",
-        "q_tags": {"waiting": "#6c7a89", "downloading": "#0b76b8",
-                   "done": "#1e9e33", "failed": "#d32f2f", "retrying": "#d48806"},
+    "day": {
+        "dark": False, "btn_other": "深色模式",
+        "root": "#f3f3f3", "side": "#f3f3f3", "nav_sel": "#e6e6e6",
+        "card": "#ffffff", "card2": "#e9e9e9", "input": "#ffffff",
+        "tonal": "#e1e1e1", "tonal_hover": "#e5f1fb",
+        "border": "#d9d9d9",
+        "btn_border": "#adadad", "input_border": "#767676",
+        "fg": "#1a1a1a", "dim": "#5f5f5f", "faint": "#8a8a8a", "ph": "#8a8a8a",
+        "accent": "#0078d7", "accent_hover": "#1a86d9", "accent_down": "#005a9e",
+        "accent_fg": "#ffffff",
+        "ok": "#107c10", "warn": "#9a7b00", "danger": "#c50f1f", "info": "#0063b1",
+        "danger_bg": "#fde7e9", "danger_bg_hover": "#fbdcdc",
+        "sel": "#0078d7", "sel_fg": "#ffffff",
+        "zebra1": "#ffffff", "zebra2": "#f7f7f7",
+        "q_tags": {"waiting": "#5f5f5f", "downloading": "#0063b1",
+                   "done": "#107c10", "failed": "#c50f1f", "retrying": "#9a7b00"},
     },
 }
+
+# 旧版设置里存的是 ttkbootstrap 主题名，映射到新调色板
+THEME_ALIASES = {"superhero": "deep", "flatly": "day", "dark": "deep", "light": "day"}
+
+# 调色板 -> ttkbootstrap 基础主题（只作底，所有样式随后被 apply_palette 覆盖）
+BASE_THEMES = {"deep": "darkly", "day": "flatly"}
+
+# 向后兼容：旧代码里的 THEMES 一律指 PALETTES
+THEMES = PALETTES
 
 HISTORY_FILE = Path.home() / ".transformed_history.json"
 LOG_FILE = Path.home() / ".transformed_log.txt"
