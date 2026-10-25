@@ -27,6 +27,8 @@ PALETTES = {
         "danger_bg": "#3c1a1e", "danger_bg_hover": "#4a2025",
         "sel": "#0078d7", "sel_fg": "#ffffff",
         "zebra1": "#2b2b2b", "zebra2": "#303030",
+        # 功能卡彩色徽章（Win10 磁贴风，深浅主题共用）
+        "chips": ["#00b294", "#0078d7", "#ca5010"],
         "q_tags": {"waiting": "#a6a6a6", "downloading": "#4cc2ff",
                    "done": "#6ccb5f", "failed": "#ff6b6b", "retrying": "#ffb900"},
     },
@@ -44,6 +46,7 @@ PALETTES = {
         "danger_bg": "#fde7e9", "danger_bg_hover": "#fbdcdc",
         "sel": "#0078d7", "sel_fg": "#ffffff",
         "zebra1": "#ffffff", "zebra2": "#f7f7f7",
+        "chips": ["#00b294", "#0078d7", "#ca5010"],
         "q_tags": {"waiting": "#5f5f5f", "downloading": "#0063b1",
                    "done": "#107c10", "failed": "#c50f1f", "retrying": "#9a7b00"},
     },

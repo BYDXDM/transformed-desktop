@@ -281,6 +281,26 @@ class App(ttk.Window):
         self._tk_recolor.append((f, ("frameb", "card")))
         return f
 
+    def _chip(self, parent, glyph, color, size=40, icon=15):
+        """Win10 磁贴风彩色图标徽章（固定品牌色，不随主题变化）"""
+        c = tk.Frame(parent, width=size, height=size, bg=color)
+        c.pack_propagate(False)
+        g = tk.Label(c, text=glyph, font=("Segoe MDL2 Assets", icon),
+                     bg=color, fg="#ffffff")
+        g.place(relx=0.5, rely=0.5, anchor="center")
+        return c
+
+    def _page_header(self, parent, title, subtitle=""):
+        """页面大标题（Win10 设置页风格）"""
+        row = self._tframe(parent, "root")
+        row.pack(fill=X, pady=(0, 12))
+        self._tlabel(row, title, (UI_FONT, 19, "bold"),
+                     fg="fg", bg="root").pack(anchor=W)
+        if subtitle:
+            self._tlabel(row, subtitle, (UI_FONT, 9),
+                         fg="dim", bg="root").pack(anchor=W, pady=(2, 0))
+        return row
+
     def _build_ui(self):
         pal = self._theme_colors()
         self._tk_recolor = []
@@ -404,30 +424,53 @@ class App(ttk.Window):
 
     # ---- 页面：格式转换 ----
     def _page_convert(self, parent):
+        self._page_header(parent, "格式转换",
+                          "选择文件或直接拖进窗口，批量转换为常见格式")
+
         grid = ttk.Frame(parent, style="TFrame")
         grid.pack(fill=BOTH, expand=True)
         for i in range(3):
             grid.grid_columnconfigure(i, weight=1, uniform="conv")
         grid.grid_rowconfigure(1, weight=1)
 
-        self._make_converter_card(grid, 0, "EPUB → TXT", "epub", "",
+        chips = self._theme_colors()["chips"]
+        self._make_converter_card(grid, 0, "EPUB → TXT", "epub", "\uE838", chips[0],
             "选择 EPUB 电子书，批量转换为纯文本",
+            ".epub  →  .txt",
             lambda: self._pick("epub", [("EPUB", "*.epub")]),
             lambda: self._convert("epub"))
 
-        self._make_converter_card(grid, 1, "MP4 → MP3", "mp4", "",
-            "提取视频中的音频轨道，保存为 MP3（支持 mp4/mkv/avi/mov/webm/flv/ts）",
+        self._make_converter_card(grid, 1, "MP4 → MP3", "mp4", "\uE8F1", chips[1],
+            "提取视频中的音频轨道，保存为 MP3",
+            ".mp4 .mkv .avi .mov .webm .flv .ts  →  .mp3",
             lambda: self._pick("mp4", [("视频文件", "*.mp4 *.mkv *.avi *.mov *.webm *.flv *.ts")]),
             lambda: self._convert("mp4"))
 
-        self._make_converter_card(grid, 2, "WebP → JPG", "webp", "",
-            "将 WebP 图片批量转换为 JPEG（也支持 png/jpg/gif/bmp/tiff 输入）",
+        self._make_converter_card(grid, 2, "WebP → JPG", "webp", "\uE9D9", chips[2],
+            "将 WebP 图片批量转换为 JPEG",
+            ".webp .png .jpg .gif .bmp .tiff  →  .jpg",
             lambda: self._pick("webp", [("图片", "*.webp *.png *.jpg *.jpeg *.gif *.bmp *.tiff")]),
             lambda: self._convert("webp"))
 
-        tip = self._tlabel(parent, "支持把文件直接拖进窗口，自动归类到对应卡片",
-                           (UI_FONT, 9), fg="faint", bg="root")
-        tip.pack(anchor=W, pady=(10, 0))
+        # 底部输出目录横幅（同时填满页面留白）
+        banner = self._card(parent)
+        banner.pack(fill=X, side=BOTTOM, pady=(12, 0))
+        b = self._tframe(banner, "card")
+        b.pack(fill=X, padx=16, pady=12)
+        self._chip(b, "\uE838", chips[0], size=32, icon=12).pack(side=LEFT, padx=(0, 12))
+        brow = self._tframe(b, "card")
+        brow.pack(fill=X, side=LEFT, expand=True)
+        self._tlabel(brow, "输出目录", (UI_FONT, 10, "bold"),
+                     fg="fg", bg="card").pack(anchor=W)
+        self._output_path_lbl = self._tlabel(brow, self.output_dir, (UI_FONT, 8),
+                                             fg="dim", bg="card")
+        self._output_path_lbl.pack(anchor=W, pady=(2, 0))
+        self._tlabel(brow, "支持把文件直接拖进窗口，按扩展名自动归类到对应卡片",
+                     (UI_FONT, 8), fg="faint", bg="card").pack(anchor=W, pady=(2, 0))
+        Button(b, text="打开文件夹", style="Accent.Small.TButton",
+               command=self._open_output_folder).pack(side=RIGHT, padx=(8, 0))
+        Button(b, text="更改目录", style="Ghost.Small.TButton",
+               command=self._set_output).pack(side=RIGHT)
 
     # ---- 页面：视频下载 ----
     def _page_download(self, parent):
@@ -586,6 +629,7 @@ class App(ttk.Window):
 
     # ---- 页面：历史记录 ----
     def _page_history(self, parent):
+        self._page_header(parent, "历史记录", "双击条目打开对应文件 · Delete 删除选中记录")
         card = self._card(parent)
         card.pack(fill=BOTH, expand=True)
         w = self._tframe(card, "card")
@@ -593,13 +637,13 @@ class App(ttk.Window):
 
         hrow = self._tframe(w, "card")
         hrow.pack(fill=X, pady=(0, 10))
-        self._tlabel(hrow, "历史记录", (UI_FONT, 10, "bold"),
-                     fg="fg", bg="card").pack(side=LEFT)
         self.filter_var = tk.StringVar(value="全部")
         for tag in ["全部", "EPUB", "MP4", "WebP", "下载"]:
             Radiobutton(hrow, text=tag, variable=self.filter_var, value=tag,
                             style="Chip.TRadiobutton",
-                            command=self.history_tree_refresh).pack(side=LEFT, padx=(10, 0))
+                            command=self.history_tree_refresh).pack(side=LEFT, padx=(0, 6))
+        self._history_count_lbl = ttk.Label(hrow, text="", style="CardDim.TLabel")
+        self._history_count_lbl.pack(side=RIGHT)
 
         cols = ("time", "file", "type", "status")
         self.tree = ttk.Treeview(w, columns=cols, show="headings",
@@ -635,6 +679,7 @@ class App(ttk.Window):
     # ---- 页面：运行日志 ----
     def _page_log(self, parent):
         pal = self._theme_colors()
+        self._page_header(parent, "运行日志", "程序运行记录（最近 200 行，完整日志在 ~/.transformed_log.txt）")
         card = self._card(parent)
         card.pack(fill=BOTH, expand=True)
         w = self._tframe(card, "card")
@@ -672,22 +717,24 @@ class App(ttk.Window):
         self._ensure_workers()
         self.status.config(text=f"下载并发已设为 {self.max_parallel}")
 
-    def _make_converter_card(self, parent, col, title, key, icon, desc, pick_fn, conv_fn):
-        """创建转换卡片（三列网格中的一列）"""
+    def _make_converter_card(self, parent, col, title, key, icon, chip, desc, exts,
+                             pick_fn, conv_fn):
+        """创建转换卡片（三列网格中的一列，带彩色图标徽章）"""
         card = self._card(parent)
         card.grid(row=0, column=col, sticky="new", padx=5, pady=2)
         inner = self._tframe(card, "card")
-        inner.pack(fill=BOTH, expand=True, padx=18, pady=16)
+        inner.pack(fill=BOTH, expand=True, padx=16, pady=14)
 
-        pal = self._theme_colors()
         head = self._tframe(inner, "card")
         head.pack(fill=X)
-        tk.Label(head, text=icon, font=("Segoe MDL2 Assets", 11),
-                 bg=pal["card"], fg=pal["accent"]).pack(side=LEFT, padx=(0, 8))
-        self._tlabel(head, title, (UI_FONT, 10, "bold"),
-                     fg="fg", bg="card").pack(side=LEFT)
+        self._chip(head, icon, chip).pack(side=LEFT, padx=(0, 10))
+        self._tlabel(head, title, (UI_FONT, 12, "bold"),
+                     fg="fg", bg="card").pack(side=LEFT, pady=(2, 0))
+
         self._tlabel(inner, desc, (UI_FONT, 9), fg="dim", bg="card",
-                     wraplength=268, justify=LEFT).pack(anchor=W, pady=(6, 12))
+                     wraplength=250, justify=LEFT).pack(anchor=W, pady=(10, 2))
+        self._tlabel(inner, exts, ("Consolas", 8), fg="faint", bg="card",
+                     wraplength=250).pack(anchor=W, pady=(0, 10))
 
         self.convert_cards[key] = {
             "files": [],
@@ -700,16 +747,18 @@ class App(ttk.Window):
         }
 
         btn_frame = self._tframe(inner, "card")
-        btn_frame.pack(fill=X, pady=(0, 12))
+        btn_frame.pack(fill=X, pady=(0, 10))
 
         Button(btn_frame, text="选择文件", style="Ghost.Small.TButton",
                    command=pick_fn).pack(side=LEFT)
         Button(btn_frame, text="开始转换", style="Accent.Small.TButton",
                    command=conv_fn).pack(side=LEFT, padx=(8, 0))
-        self.convert_cards[key]["label"].pack(side=RIGHT)
 
-        self.convert_cards[key]["progress"].pack(fill=X, pady=(0, 6))
-        self.convert_cards[key]["status"].pack(anchor=W)
+        self.convert_cards[key]["progress"].pack(fill=X, pady=(0, 4))
+        row = self._tframe(inner, "card")
+        row.pack(fill=X)
+        self.convert_cards[key]["status"].pack(side=LEFT)
+        self.convert_cards[key]["label"].pack(side=RIGHT)
     
     # ---- 功能方法 ----
     def _set_output(self):
@@ -718,6 +767,11 @@ class App(ttk.Window):
             self.output_dir = d
             Path(d).mkdir(parents=True, exist_ok=True)
             self.settings.set("output_dir", d)
+            if getattr(self, "_output_path_lbl", None):
+                try:
+                    self._output_path_lbl.config(text=d)
+                except tk.TclError:
+                    pass
             self.status.config(text=f"输出目录: {d}（已记住）")
 
     # ---- 主题 ----
@@ -1852,6 +1906,13 @@ class App(ttk.Window):
                              tags=("even" if row % 2 == 0 else "odd",),
                              values=(h.get("time", ""), str(h.get("name", ""))[:25], typ, s))
             row += 1
+        if getattr(self, "_history_count_lbl", None):
+            try:
+                self._history_count_lbl.config(
+                    text=f"共 {len(items)} 条 · 显示 {row} 条" if row != len(items)
+                    else f"共 {len(items)} 条记录")
+            except tk.TclError:
+                pass
     
     def _on_history_double_click(self, event):
         """双击历史记录：打开对应的输出文件"""
