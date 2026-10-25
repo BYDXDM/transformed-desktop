@@ -503,6 +503,26 @@ class App(ttk.Window):
                    command=self._start_queue).pack(side=RIGHT)
 
         # --- 下载队列 ---
+        # 进度卡先占住底部、队列吃剩余空间：窗口较矮时被裁的是队列而不是进度条
+        p_card = self._card(parent)
+        p_card.pack(fill=X, side=BOTTOM)
+        p = self._tframe(p_card, "card")
+        p.pack(fill=X, padx=16, pady=12)
+        prow = self._tframe(p, "card")
+        prow.pack(fill=X)
+        self.dl_total_label = ttk.Label(prow, text="总进度: 0/0", style="CardDim.TLabel")
+        self.dl_total_label.pack(side=LEFT, padx=(0, 12))
+        self.dl_total_prog = Progressbar(prow, mode="determinate",
+                                         style="Ok.Horizontal.TProgressbar")
+        self.dl_total_prog.pack(side=LEFT, fill=X, expand=True)
+        prow2 = self._tframe(p, "card")
+        prow2.pack(fill=X, pady=(8, 0))
+        self.dl_stat = ttk.Label(prow2, text="", style="CardDim.TLabel")
+        self.dl_stat.pack(side=LEFT, padx=(0, 12))
+        self.dl_prog = Progressbar(prow2, mode="determinate",
+                                   style="Horizontal.TProgressbar")
+        self.dl_prog.pack(side=LEFT, fill=X, expand=True)
+
         q_card = self._card(parent)
         q_card.pack(fill=BOTH, expand=True, pady=(0, 12))
         q = self._tframe(q_card, "card")
@@ -563,25 +583,6 @@ class App(ttk.Window):
         Button(q_btns, text="清空队列", style="Danger.Small.TButton",
                    command=self._queue_clear).pack(side=RIGHT, padx=(16, 10))
 
-        # --- 进度区 ---
-        p_card = self._card(parent)
-        p_card.pack(fill=X)
-        p = self._tframe(p_card, "card")
-        p.pack(fill=X, padx=16, pady=12)
-        prow = self._tframe(p, "card")
-        prow.pack(fill=X)
-        self.dl_total_label = ttk.Label(prow, text="总进度: 0/0", style="CardDim.TLabel")
-        self.dl_total_label.pack(side=LEFT, padx=(0, 12))
-        self.dl_total_prog = Progressbar(prow, mode="determinate",
-                                             style="Ok.Horizontal.TProgressbar")
-        self.dl_total_prog.pack(side=LEFT, fill=X, expand=True)
-        prow2 = self._tframe(p, "card")
-        prow2.pack(fill=X, pady=(8, 0))
-        self.dl_stat = ttk.Label(prow2, text="", style="CardDim.TLabel")
-        self.dl_stat.pack(side=LEFT, padx=(0, 12))
-        self.dl_prog = Progressbar(prow2, mode="determinate",
-                                       style="Horizontal.TProgressbar")
-        self.dl_prog.pack(side=LEFT, fill=X, expand=True)
 
     # ---- 页面：历史记录 ----
     def _page_history(self, parent):
