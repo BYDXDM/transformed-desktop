@@ -74,16 +74,36 @@ def conv_mp4(path, out_dir, cb):
         return False, str(e)
 
 
+_JPEG_SAFE_MODES = ("RGB", "L", "CMYK")
+
+
+def _as_jpeg_writable(img):
+    """把任意 Pillow 图片收敛为 JPEG 可编码模式（L/RGB/CMYK）。
+
+    Pillow 的 JPEG 编码器只认这三种模式：P（GIF/部分 PNG/BMP）、PA、LA、
+    I;16 等直接 save 会抛 "cannot write mode P as JPEG"。带 alpha 的
+    （RGBA/LA/带透明索引的调色板图）先转 RGBA 再铺白底合成，避免透明区域
+    变黑；无 alpha 的统一转 RGB（L/CMYK 本身可编码，保持原样不重复转换）。
+    """
+    if img.mode in _JPEG_SAFE_MODES:
+        return img
+    has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+        img.mode == "P" and "transparency" in img.info)
+    if has_alpha:
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.split()[3])
+        return bg
+    return img.convert("RGB")
+
+
 def conv_webp(path, out_dir, cb):
     try:
         cb(0.3, "解码...")
         img = Image.open(path)
         name = Path(path).stem
         out = _validated_output_file(Path(out_dir) / f"{name}.jpg", out_dir)
-        if img.mode == "RGBA":
-            bg = Image.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
-            img = bg
+        img = _as_jpeg_writable(img)
         cb(0.6, "编码...")
         img.save(out, "JPEG", quality=92)
         cb(1.0, "完成")

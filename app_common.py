@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """应用级通用模块：常量、路径校验、日志、历史记录、设置持久化。"""
 import json
+import re
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +74,53 @@ def _validated_output_file(path, base):
     if target != base and base not in target.parents:
         raise ValueError(f"拒绝写入 {base} 之外的路径: {target}")
     return target
+
+
+# ===== Windows 安全文件名（纯函数，供下载文件名清洗与单测使用） =====
+
+# 保留设备名：即使带扩展名（CON.mp3）也不允许作文件名主干，需加前缀绕开
+_WINDOWS_RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)])
+
+# 非法字符：9 个保留符号 + 控制字符（含 DEL）
+_WINDOWS_ILLEGAL_RE = re.compile(r'[\x00-\x1f\x7f\\/:*?"<>|]')
+
+
+def _truncate_utf16_units(s, max_units):
+    """按 UTF-16 编码单元数截断字符串（Windows 路径长度按此计数）。
+
+    不从中间拆开代理对（emoji 等增补平面字符占 2 个单元）。
+    """
+    if max_units <= 0 or not s:
+        return ""
+    raw = s.encode("utf-16-le", "ignore")
+    if len(raw) <= max_units * 2:
+        return s
+    raw = raw[:max_units * 2]
+    if 0xD8 <= raw[-1] <= 0xDB:
+        # 截断落在代理对中间：只剩高代理（低代理被切掉），丢弃整个残留单元
+        raw = raw[:-2]
+    return raw.decode("utf-16-le", "ignore")
+
+
+def sanitize_windows_filename(name, max_len=240, fallback=""):
+    """把任意标题清洗成合法的 Windows 文件名主干（不含扩展名）。
+
+    覆盖：非法字符 \\/:*?"<>| 与控制字符替换为 "_"、结尾的点和空格剥除
+    （Windows 会静默剥掉，导致记录的文件名与实际不符）、保留设备名加 "_"
+    前缀、超长按 UTF-16 单元截断。max_len 是标题本身的预算，调用方需先
+    扣除目录、分隔符与扩展名的长度（保证整路径 ≤240 字符）。
+    清洗后为空（如标题只有非法字符/全是点）时返回 fallback。
+    """
+    cleaned = _WINDOWS_ILLEGAL_RE.sub("_", str(name)).strip()
+    cleaned = _truncate_utf16_units(cleaned, max_len)
+    # 先截断再剥尾点/尾空格：截断可能恰好断在点或空格上
+    cleaned = cleaned.rstrip(" .")
+    if cleaned.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned
+    return cleaned or str(fallback)
 
 
 # 日志线程锁：防止多线程并发写/裁剪造成竞态

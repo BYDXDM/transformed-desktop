@@ -20,6 +20,7 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 import threading
 import time
+from collections import deque
 import os
 import json
 import re
@@ -42,7 +43,7 @@ from net_guard import guarded_urlopen
 from app_common import (
     APP_VERSION, UI_FONT, PALETTES, THEME_ALIASES, BASE_THEMES,
     HISTORY_FILE, LOG_FILE, Logger, History, AppSettings,
-    _validated_output_file, _LOG_LOCK,
+    _validated_output_file, _LOG_LOCK, sanitize_windows_filename,
 )
 import ui_style
 from ffmpeg_tools import download_ffmpeg, get_ffmpeg_path, media_duration
@@ -139,6 +140,11 @@ class App(ttk.Window):
         except (TypeError, ValueError):
             self.max_parallel = 2
         self._progress_events = UiProgressEventQueue()
+        # toast/错误弹窗不走上面的 mailbox：其"同源只留最新"语义是为进度条设计
+        # 的，逐条消息共用它会互相吞掉（并行下载多个失败时只剩最后一条）。
+        # 消息进 FIFO 由 _pump_messages 在 UI 线程逐条弹出。
+        self._pending_msgs = deque()
+        self._msg_lock = threading.Lock()
 
         # 侧边栏看板娘立绘（深海女仆工坊 · 鲸鱼娘 CC BY-NC-SA 4.0）
         self.img_side = self._load_whale("whale_left.webp", 210, 420)
@@ -151,6 +157,7 @@ class App(ttk.Window):
         self._update_bili_btn()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._ui_drain_after_id = self.after(50, self._drain_progress_events)
+        self.after(150, self._pump_messages)
         self._check_deps()
         # 延迟几秒再静默检查更新，不影响启动速度
         self.after(2500, self._check_update_async)
@@ -242,11 +249,33 @@ class App(ttk.Window):
             self.task_running = False
     
     def show_toast(self, title, msg, level="info", _from_thread=False):
-        """可靠的消息弹窗；后台线程通过有界 UI mailbox 调度。"""
+        """可靠的消息弹窗；后台线程发来的进 FIFO 逐条展示（mailbox 同源覆盖
+        会让并行失败时只剩最后一条），UI 线程直接弹出保持原行为。"""
         if _from_thread:
-            self._run_on_ui("toast", lambda: self._show_toast_ui(title, msg, level))
+            self._queue_message(title, msg, level)
             return
         self._show_toast_ui(title, msg, level)
+
+    def _queue_message(self, title, msg, level):
+        """线程安全入队；worker 线程不碰 Tk，由 _pump_messages 统一弹出。"""
+        with self._msg_lock:
+            self._pending_msgs.append((str(title), str(msg), level))
+
+    def _pump_messages(self):
+        """每 150ms 检查消息队列，有消息就弹一条。messagebox 是模态的：
+        用户关闭当前弹窗后本轮才返回，下一次 tick 再弹下一条——既保证
+        每条都被看到，又不会在模态事件循环里重入自身。"""
+        if self._ui_closing:
+            return
+        with self._msg_lock:
+            msg = self._pending_msgs.popleft() if self._pending_msgs else None
+        if msg is not None:
+            self._show_toast_ui(*msg)
+        try:
+            self.after(150, self._pump_messages)
+        except tk.TclError:
+            # 窗口销毁后安静退出
+            pass
     
     def _show_toast_ui(self, title, msg, level="info"):
         # 用 tkinter 原生 messagebox，中文渲染绝对可靠，避免"空弹窗"
@@ -1246,7 +1275,11 @@ class App(ttk.Window):
         uid = item["uid"]
         with self._dl_pcts_lock:
             self._dl_pcts[uid] = 0.0
-        title = re.sub(r'[\\/:*?"<>|]', "_", media["title"]).strip() or "bilibili"
+        out_dir = Path(self.output_dir)
+        # 整路径 ≤240 字符（MAX_PATH 260 留安全余量）：扣除分隔符与扩展名/
+        # 去重后缀约 12 字符才是标题预算；下限 24 防止目录过深时预算为负
+        title_budget = max(24, 240 - len(str(out_dir)) - 1 - 12)
+        title = sanitize_windows_filename(media["title"], title_budget) or "bilibili"
         headers = {
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                            "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1254,7 +1287,6 @@ class App(ttk.Window):
             "Referer": "https://www.bilibili.com/",
             "Cookie": _bili_cookie_header(),
         }
-        out_dir = Path(self.output_dir)
 
         def ydl_fetch(url, lo, hi, what, tag):
             """用 yt-dlp 通用下载器拉取 CDN 直链，进度映射到 [lo, hi]"""
@@ -1483,12 +1515,12 @@ class App(ttk.Window):
                 item["status"] = "failed"
                 item["error"] = reason
                 Logger.log(f"⚠ 外网受限: {reason}")
-                self._run_on_ui("download-error", lambda r=reason: (
-                    self.dl_prog.config(value=0),
-                    self._show_toast_ui("需要代理",
-                        f"该视频在 YouTube/X，当前网络无法直接访问。\n\n{r}\n\n"
-                        f"建议: 开启代理/VPN 后重试。\nB站等国内视频不受影响，可正常下载。",
-                        "warning")))
+                # 进度条复位走 mailbox（可覆盖），弹窗进 FIFO 逐条展示
+                self._run_on_ui("download-error", lambda: self.dl_prog.config(value=0))
+                self._queue_message("需要代理",
+                    f"该视频在 YouTube/X，当前网络无法直接访问。\n\n{reason}\n\n"
+                    f"建议: 开启代理/VPN 后重试。\nB站等国内视频不受影响，可正常下载。",
+                    "warning")
                 return
             Logger.log(f"✅ 外网可访问: {reason}")
 
@@ -1647,11 +1679,12 @@ class App(ttk.Window):
                 hint = "\n\n提示: 链接无效或已失效，请检查"
             elif "ffmpeg" in err.lower() or "ffprobe" in err.lower():
                 hint = "\n\n提示: 需要 ffmpeg，MP3下载或部分视频需要"
+            # 状态栏/进度条走 mailbox（可覆盖），错误弹窗进 FIFO 逐条展示
             self._run_on_ui("download-error", lambda: (
                 self.status.config(text=f"下载失败: {item['name'][:30]}"),
-                self._show_toast_ui("下载失败", err[:300] + hint, "error"),
                 self.dl_prog.stop(),
                 self.dl_prog.config(value=0, mode="determinate")))
+            self._queue_message("下载失败", err[:300] + hint, "error")
 
     def _fmt_speed(self, speed):
         """格式化下载速度"""
