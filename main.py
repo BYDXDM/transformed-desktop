@@ -133,6 +133,7 @@ class App(ttk.Window):
         self._ui_closing = False
         self._url_placeholder_active = True
         self._dl_pcts = {}           # uid -> 单调递增显示进度(0~1)
+        self._dl_pcts_lock = threading.RLock()  # 多 worker 并发读写;可重入(回调内聚合会再次进入)
         try:
             self.max_parallel = max(1, min(3, int(self.settings.get("parallel") or 2)))
         except (TypeError, ValueError):
@@ -1233,21 +1234,18 @@ class App(ttk.Window):
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 shell=False, creationflags=no_window)
-        try:
-            proc.wait()
-        finally:
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
+        # communicate() 一次性收齐输出并自动排水双管道（防管道缓冲写满死锁），
+        # 失败时 stderr 仍可读——不能用 wait()+close 再 read（会读到已关闭的管道）
+        _, err = proc.communicate()
         if proc.returncode != 0:
-            err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-300:]
-            raise RuntimeError("ffmpeg 处理失败(code=%d): %s" % (proc.returncode, err))
+            msg = (err or b"").decode("utf-8", errors="replace")[-300:]
+            raise RuntimeError("ffmpeg 处理失败(code=%d): %s" % (proc.returncode, msg))
 
     def _download_bili_direct(self, item, media, is_mp3, cb):
         """B站 API 直链下载（绕过网页 412）。失败抛异常，由调用方回退 yt-dlp。"""
         uid = item["uid"]
-        self._dl_pcts[uid] = 0.0
+        with self._dl_pcts_lock:
+            self._dl_pcts[uid] = 0.0
         title = re.sub(r'[\\/:*?"<>|]', "_", media["title"]).strip() or "bilibili"
         headers = {
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1340,7 +1338,8 @@ class App(ttk.Window):
                     Path(t).unlink(missing_ok=True)
                 except Exception:
                     pass
-            self._dl_pcts.pop(uid, None)
+            with self._dl_pcts_lock:
+                self._dl_pcts.pop(uid, None)
 
     def _enqueue_urls(self):
         """把输入框中的链接加入队列（跨批次去重）。返回 (新增数, 跳过数)"""
@@ -1435,7 +1434,8 @@ class App(ttk.Window):
 
     def _aggregate_dl_pct(self):
         """所有进行中下载的平均进度(0~1)，用于底部聚合进度条"""
-        vals = list(self._dl_pcts.values())
+        with self._dl_pcts_lock:
+            vals = list(self._dl_pcts.values())
         return sum(vals) / len(vals) if vals else 0.0
 
     def _do_dl_item(self, item):
@@ -1444,7 +1444,8 @@ class App(ttk.Window):
         is_mp3 = item["is_mp3"]
         # 单调递增的显示进度(0~1)，按条目隔离以支持并行下载
         uid = item["uid"]
-        self._dl_pcts[uid] = 0.0
+        with self._dl_pcts_lock:
+            self._dl_pcts[uid] = 0.0
 
         if not HAS_YTDLP:
             item["status"] = "failed"
@@ -1454,9 +1455,10 @@ class App(ttk.Window):
 
         def cb(pct, msg):
             pct = max(pct, 0.05)
-            self._dl_pcts[uid] = max(self._dl_pcts[uid], pct)
-            item["progress"] = f"{self._dl_pcts[uid]*100:.1f}%"
-            agg = self._aggregate_dl_pct() * 100
+            with self._dl_pcts_lock:
+                self._dl_pcts[uid] = max(self._dl_pcts[uid], pct)
+                item["progress"] = f"{self._dl_pcts[uid]*100:.1f}%"
+                agg = self._aggregate_dl_pct() * 100
             self._schedule_progress_ui(
                 "download",
                 lambda p=agg, m=msg: (
@@ -1500,10 +1502,11 @@ class App(ttk.Window):
                 eta = d.get('eta') or 0
                 if total:
                     mapped = 0.05 + (downloaded / total) * 0.90
-                    self._dl_pcts[uid] = max(self._dl_pcts[uid], mapped)
-                    pct_show = self._dl_pcts[uid] * 100
-                    item["progress"] = f"{pct_show:.1f}%"
-                    agg = self._aggregate_dl_pct() * 100
+                    with self._dl_pcts_lock:
+                        self._dl_pcts[uid] = max(self._dl_pcts[uid], mapped)
+                        pct_show = self._dl_pcts[uid] * 100
+                        item["progress"] = f"{pct_show:.1f}%"
+                        agg = self._aggregate_dl_pct() * 100
                     self._schedule_progress_ui(
                         "download",
                         lambda p=agg, s=speed, e=eta: (
@@ -1551,7 +1554,8 @@ class App(ttk.Window):
                 return self._download_bili_direct(item, media, is_mp3, cb)
             except Exception as e:
                 Logger.log("B站直连下载失败，回退 yt-dlp 网页模式: %s" % e)
-                self._dl_pcts[uid] = 0.0
+                with self._dl_pcts_lock:
+                    self._dl_pcts[uid] = 0.0
 
         try:
             self._dl_with_ytdlp(item, ready_url, is_mp3, is_foreign,
@@ -1621,7 +1625,8 @@ class App(ttk.Window):
                 Logger.log(f"网络抖动(代理出口可能已切换)，3 秒后自动重试: {e}")
                 item["status"] = "retrying"
                 item["progress"] = ""
-                self._dl_pcts[uid] = 0.0
+                with self._dl_pcts_lock:
+                    self._dl_pcts[uid] = 0.0
                 self._run_on_ui("queue-refresh", self._queue_refresh_tree)
                 time.sleep(3)
                 self._dl_with_ytdlp(item, ready_url, is_mp3, is_foreign, bili_headers,

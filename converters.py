@@ -9,7 +9,7 @@ from pathlib import Path
 from PIL import Image
 
 from app_common import _validated_output_file
-from ffmpeg_tools import get_ffmpeg_path, media_duration
+from ffmpeg_tools import get_ffmpeg_path
 
 try:
     from ebooklib import epub
@@ -50,38 +50,22 @@ def conv_mp4(path, out_dir, cb):
     # GUI(pythonw) 模式下防止 ffmpeg 弹出黑色控制台窗口
     no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     try:
-        cb(0.05, "读取时长...")
-        duration = media_duration(ffmpeg, path, no_window)
+        cb(0.05, "转换中...")
         name = Path(path).stem
         out = _validated_output_file(Path(out_dir) / f"{name}.mp3", out_dir)
         cmd = [ffmpeg, "-nostdin", "-loglevel", "error",
                "-i", str(path), "-vn",
                "-acodec", "libmp3lame", "-ab", "192k",
                "-y", str(out)]
-        if duration:
-            cmd += ["-progress", "pipe:1"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, shell=False,
                                 creationflags=no_window)
-        try:
-            for line in proc.stdout:
-                text = line.decode("ascii", "replace").strip()
-                # out_time_ms 单位是微秒；按已转换时长映射到 5%~95%
-                if duration and text.startswith("out_time_ms="):
-                    try:
-                        ratio = max(0.0, min(float(text.split("=", 1)[1]) / 1e6 / duration, 1.0))
-                        cb(0.05 + ratio * 0.9, f"转换中 {ratio * 100:.0f}%")
-                    except ValueError:
-                        pass
-            proc.wait()
-        finally:
-            if proc.stdout:
-                proc.stdout.close()
-            if proc.stderr:
-                proc.stderr.close()
+        # communicate() 一次性收齐输出并自动排水双管道（防管道缓冲写满死锁），
+        # 失败时 stderr 仍可读——不能用 wait()+close 再 read（会读到已关闭的管道）
+        _, err = proc.communicate()
         if proc.returncode != 0:
-            err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")[-300:]
-            return False, f"ffmpeg 转换失败(code={proc.returncode}): {err}"
+            msg = (err or b"").decode("utf-8", errors="replace")[-300:]
+            return False, f"ffmpeg 转换失败(code={proc.returncode}): {msg}"
         if not Path(out).exists() or Path(out).stat().st_size == 0:
             return False, "ffmpeg 未生成输出文件"
         cb(1.0, "完成")

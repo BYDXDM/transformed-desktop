@@ -4,5 +4,4 @@ pyinstaller==5.13.2
 ttkbootstrap==1.10.1
 pillow==10.4.0
 yt-dlp==2024.8.6
-mutagen==1.47.0
 ebooklib==0.18
